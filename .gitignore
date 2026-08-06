@@ -1,0 +1,25 @@
+# Python 虚拟环境
+venv/
+env/
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# 临时文件
+*.log
+test_result.txt
+rebuild_db.py
+sync_expiry.py
+sync_data.py
+
+# 大文件/二进制
+*.rar
+*.zip
