@@ -23,3 +23,33 @@ sync_data.py
 # 大文件/二进制
 *.rar
 *.zip
+
+# 临时/调试脚本与文件（不入库）
+*.bak*
+*.bak.*.*
+*.bak.*
+_debug_*.py
+_err.txt
+_out.txt
+_probe_*.py
+_run_sync_*.py
+_sync_*.py
+_tmp_*.py
+_scan_settings_*.html
+_test_*.py
+mini_test.py
+offline_test.py
+selftest_*.py
+analyze_feasibility.py
+fix_option_expiry_*.py
+probe_expired_window.py
+test_*.py
+ck.txt
+_err.txt
+
+# 敏感/本地配置文件（不入库）
+login.json
+sa.json
+rc.json
+st.json
+*.json.local
