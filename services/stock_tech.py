@@ -453,26 +453,23 @@ def _preload_worker():
     print("[技术分析] 指标缓存预加载完成: %d 标的就绪" % _ok, flush=True)
 
 
-# ==================== 形态总数(网关导航徽标数据源, 2026-10-14) ====================
-# 用户需求: "形态总数放在技术分析后面显示, 即使用户在别的模块也能看到总数"。
-# 网关内容区是单 iframe 换 src —— 一切到别的模块, 技术分析页面(含悬浮球/顶栏徽标)
-# 就被销毁, 页面内的总数停止更新。故总数改由【服务端常驻聚合】提供:
-#   - 每 15s 读一遍指标预热缓存 _CACHE(默认参数键), 按前端 patList() 的同一口径
-#     逐周期数形态 chip(shapes/背离/MACD·KDJ 交叉/RSI·KDJ 提示), 加总写入 _PAT_TOTAL;
-#   - 只读缓存, 零新增天勤订阅/计算, 不挤占 GIL(与技术分析预热同源, 不添新负载);
-#   - 月份合约(股指期货)只在技术分析页打开期间才进缓存, 用【粘滞计数】_PAT_LAST 保留
-#     其最后一次值, 避免用户切到别的模块时总数跳水; 指数本身由预热 worker 持续保温, 恒 Live。
-_PAT_TOTAL = {"total": 0, "ts": 0.0, "ready": 0, "scope": 0}
+# ==================== 形态总数(单一数据源, 2026-10-17 重构) ====================
+# 用户需求演进:
+#   10-14: "形态总数放在技术分析后面显示, 即使用户在别的模块也能看到总数";
+#   10-17: "这两个地方的数量要一样啊。应该是把这个数字作为一个公共方法里的计算值,
+#           两边操作…取值的地方(模块后面的数字/顶上/右下角)调接口直接取这个值"。
+# 故确立【单一数据源】架构:
+#   - 唯一计算方法 = _pat_total_refresh()(服务端常驻, 5s 一拍, 纯内存读 _CACHE 零计算);
+#   - 唯一取值口 = GET /api/pattern_total(返回 total + rows 明细);
+#   - 三处展示全部调它: 网关导航徽标(20s 轮询) / 页面顶栏徽标(5s) / 右下角悬浮球(5s);
+#   - 页面本地 patCheck 只做【新增检测/未读/响铃】, 不再自己算总数(历史事故: 页面自己算
+#     导致徽章 45 vs 页面 12 双口径, 见 2026-10-17 记忆)。
+# 月份合约(股指期货)只在技术分析页打开期间才进缓存, 用【粘滞计数】_PAT_LAST 保留
+# 其最后一次值, 避免用户切到别的模块时总数跳水; 指数本身由预热 worker 持续保温, 恒 Live。
+_PAT_TOTAL = {"total": 0, "ts": 0.0, "ready": 0, "scope": 0, "rows": []}
 _PAT_TOTAL_LOCK = threading.Lock()
 _PAT_LAST = {}                      # symbol -> 最近一次形态数(粘滞, 只增不清零)
 _PAT_WORKER_STARTED = False
-# 页面上报值(2026-10-17): 多标页每拍把【当前页 scope】的形态总数 POST 上来,
-# 导航徽标优先展示它 —— 用户诉求"左侧模块数字与页面顶部不一致":
-#   徽标原口径 = 全局(DEFAULT 6 + EXTRA 11 候选 + 月份合约), 页面顶部 = [LEFT]+RIGHT+已加载子合约,
-#   两边注定对不上(实测 45 vs 12)。统一为"页面上报即所见": 页面开着时两边严格同源;
-#   页面关闭后保留最后值(age 增长, 网关侧自动标"数据陈旧"); 服务重启后回落聚合值兜底。
-_PAT_PAGE = {"total": 0, "ts": 0.0, "ready": 0, "scope": 0, "src": "agg"}
-_PAT_PAGE_LOCK = threading.Lock()
 
 
 def _pat_count_period(pe):
@@ -522,9 +519,31 @@ def _pat_scope_symbols():
     return syms
 
 
+def _pat_sym_name(sym):
+    """rows 展示名: 指数取 DEFAULT/EXTRA 名; 月份合约按 产品名+年月(与 api_fut_months 同规则)。"""
+    for it in DEFAULT_INSTRUMENTS:
+        if it["symbol"] == sym:
+            return it["name"]
+    nm = _EXTRA_INDEX_NAMES.get(sym)
+    if nm:
+        return nm
+    for _idx, (product, pname) in INDEX_FUT_PRODUCT.items():
+        code = product.split(".")[-1]
+        if sym.startswith(product):
+            ym = sym.split(".")[-1][len(code):]
+            return pname + ym
+    return sym
+
+
 def _pat_total_refresh():
-    """聚合一轮形态总数(纯内存读缓存, 无网络无计算)。返回总数。"""
+    """聚合一轮形态总数 + 明细(纯内存读缓存, 无网络无计算)。返回总数。
+
+    这是全系统【唯一】的形态总数计算方法(用户 10-17 裁定"公共方法里的计算值"):
+    导航徽标 / 页面顶栏徽标 / 悬浮球 / 预警明细全部由它经 GET /api/pattern_total 取数,
+    任何一侧都不再自行计算, 从根上消除双口径。
+    """
     total, ready = 0, 0
+    rows = []
     for sym in _pat_scope_symbols():
         cnt = None
         for key, _label, _dur, _cnt in TECH_PERIODS:
@@ -535,10 +554,15 @@ def _pat_total_refresh():
         if cnt is not None:            # 有缓存(哪怕 0 个形态) -> 刷新粘滞值
             _PAT_LAST[sym] = cnt
             ready += 1
-        total += _PAT_LAST.get(sym, 0)   # 无缓存(如月份合约离开页面后): 保留粘滞值
+        else:                          # 无缓存(如月份合约离开页面后): 保留粘滞值
+            cnt = _PAT_LAST.get(sym, 0)
+        total += cnt
+        if cnt > 0:
+            rows.append({"sym": sym, "name": _pat_sym_name(sym), "n": cnt})
+    rows.sort(key=lambda r: (-r["n"], r["sym"]))
     with _PAT_TOTAL_LOCK:
         _PAT_TOTAL.update({"total": total, "ts": time.time(),
-                           "ready": ready, "scope": len(_PAT_LAST)})
+                           "ready": ready, "scope": len(_PAT_LAST), "rows": rows})
     return total
 
 
@@ -548,7 +572,7 @@ def _pat_total_worker():
             _pat_total_refresh()
         except Exception as _e:
             print("[技术分析] 形态总数聚合异常(已忽略): %s" % str(_e)[:80], flush=True)
-        time.sleep(15)
+        time.sleep(5)
 
 
 def start_pat_total_worker():
@@ -558,36 +582,19 @@ def start_pat_total_worker():
         return
     _PAT_WORKER_STARTED = True
     threading.Thread(target=_pat_total_worker, daemon=True, name="tech-pat-total").start()
-    print("[技术分析] 形态总数聚合线程已启动(网关导航徽标数据源, 15s 一拍)", flush=True)
+    print("[技术分析] 形态总数聚合线程已启动(单一数据源: 徽标/顶栏/悬浮球共用一个值, 5s 一拍)", flush=True)
 
 
 def api_pattern_total():
-    """GET /stocktech/api/pattern_total —— 网关导航"技术分析"项后面的形态总数。
+    """GET /stocktech/api/pattern_total —— 形态总数【唯一取值口】(单一数据源)。
 
-    取值优先级(2026-10-17): 页面上报值(_PAT_PAGE) > 服务端聚合值(_PAT_TOTAL)。
-    页面上报值 = 多标页 patCheck() 的 _patTotal, 与页面顶部"🔔 形态 N"逐帧同源;
-    页面从未打开(或服务刚重启)时回落聚合线程的全局口径兜底。
+    返回 _pat_total_refresh() 的聚合快照: total = 形态总数, rows = 各标的明细
+    (按数量降序, 供悬浮球/顶栏点开的预警面板直接渲染)。
+    三处展示共用它: 网关导航徽标 / 页面顶栏徽标 / 右下角悬浮球 —— 永远同一个数。
     """
-    with _PAT_PAGE_LOCK:
-        snap = dict(_PAT_PAGE)
-    if snap.get("ts"):
-        ts = snap.get("ts") or 0
-        age = max(0, int(time.time() - ts)) if ts else -1
-        try:
-            upd = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "--:--:--"
-        except Exception:
-            upd = "--:--:--"
-        return jsonify({
-            "ok": True,
-            "total": int(snap.get("total") or 0),
-            "ready": int(snap.get("ready") or 0),
-            "scope": int(snap.get("scope") or 0),
-            "age": age,
-            "updated_at": upd,
-            "src": "page",
-        })
     with _PAT_TOTAL_LOCK:
         snap = dict(_PAT_TOTAL)
+        rows = list(snap.get("rows") or [])
     ts = snap.get("ts") or 0
     age = max(0, int(time.time() - ts)) if ts else -1
     try:
@@ -601,34 +608,8 @@ def api_pattern_total():
         "scope": int(snap.get("scope") or 0),
         "age": age,
         "updated_at": upd,
-        "src": "agg",
+        "rows": rows,
     })
-
-
-def api_pattern_total_report():
-    """POST /stocktech/api/pattern_total —— 多标页每拍上报当前页形态总数。
-
-    body: {"total": int, "rows": [[sym, n], ...], "scope": int}
-      total = 页面顶部徽标/悬浮球展示的同一个数(patCheck 的 _patTotal);
-      rows  = 有形态的标的明细(ready = len(rows));
-      scope = 本拍统计范围的标的数([LEFT]+RIGHT+已发现月份合约)。
-    只写内存, 零数据库/零天勤; 网关导航徽标(20s 轮询 GET)读它。
-    """
-    data = request.get_json(silent=True) or {}
-    try:
-        total = int(data.get("total") or 0)
-        scope = int(data.get("scope") or 0)
-        rows = data.get("rows") or []
-    except Exception:
-        return jsonify({"ok": False, "msg": "bad payload"}), 400
-    if total < 0 or total > 99999 or scope < 0 or scope > 500:
-        return jsonify({"ok": False, "msg": "out of range"}), 400
-    if not isinstance(rows, list) or len(rows) > 500:
-        return jsonify({"ok": False, "msg": "bad rows"}), 400
-    with _PAT_PAGE_LOCK:
-        _PAT_PAGE.update({"total": total, "ts": time.time(),
-                          "ready": len(rows), "scope": scope, "src": "page"})
-    return jsonify({"ok": True, "total": total})
 
 
 # ===================== 指标补充 =====================
@@ -4567,7 +4548,7 @@ def tech_multi_page():
     //   与上一拍比对 —— 只有【新增】才响铃(8s 冷却防刷屏), 首拍不响; 形态消失后再次出现会重新计为新增。
     // 声音走 WebAudio 振荡器(无音频文件); 浏览器自动播放策略要求先有一次
     //   用户手势, 故挂 pointerdown 解锁 —— 未解锁前徽标/圆球照常, 只是暂时静音。
-    var _patPrev={}, _patRows=[], _patTotal=0, _patDDOpen=false, _lastBeep=0, _actx=null;
+    var _patPrev={}, _patDDOpen=false, _lastBeep=0, _actx=null;
     // 2026-09-20 提醒升级: ①点球/点徽标 = 已读(此后只在【再有新增】时响) ②× = 收拢(不关闭)
     //   ③降噪: 预载静默 + 首段静默 + 冷却合并补响 + flap 抑制 + 后台不响(切回补响) ④未读脉冲 + 顶栏 +N
     //   ⑤试听: 下拉标题行右侧「试听」-> patTest() -> patPlay(true) 绕过全部静默门禁(静音开关不拦主动试听)。
@@ -4643,15 +4624,18 @@ def tech_multi_page():
       //   - 每个标签(左栏+右栏): 统计 指数本身 + 旗下全部月份合约(_ddMonths) 的形态数(=patDdTitle 口径)。
       //   - 悬浮球=全页监控覆盖总量(含子合约); 下拉明细逐行相加与球一致。
       //   - 标签上的 .tabcnt 仍为"该标签当前正在看的标的"(合约视图=那张合约), 二者口径不同, 属预期。
+      // 🔴 2026-10-17 单一数据源重构(用户裁定"公共方法里的计算值, 取值的地方调接口"):
+      //   本函数【不再计算/不再展示总数】—— 顶栏徽标/悬浮球/预警明细的数字一律来自
+      //   GET api/pattern_total(服务端 _pat_total_refresh 聚合, 与左侧导航徽标同值);
+      //   这里只保留: 新增检测(_patPrev/_patSeen) -> 未读 +N -> 提示音。
       var syms=[LEFT]; RIGHT.forEach(function(s){ syms.push(s); });
-      var rows=[], total=0, newN=0;      // newN = 本拍【真正的新增】条数(已读过 flap/首次门槛)
+      var newN=0;      // newN = 本拍【真正的新增】条数(已读过 flap/首次门槛)
       syms.forEach(function(sym){
         // 指数本身
         var d=_data[sym];
         if(d&&_ready[sym]&&hasData(d)){
           var names=patList(d);
           if(names.length){
-            rows.push({sym:sym,n:names.length}); total+=names.length;
             var cur=names.slice().sort().join('|'), prev=_patPrev[sym]||'';
             if(prev){ var pp={}; prev.split('|').forEach(function(x){ if(x) pp[x]=1; });
               for(var i=0;i<names.length;i++){ if(!pp[names[i]]&&patFresh(sym,names[i])) newN++; } }
@@ -4666,7 +4650,6 @@ def tech_multi_page():
           if(!md||!_ready[ms]||!hasData(md)) return;      // 取数抖动: 保留基线, 避免误判新增
           var mn=patList(md);
           if(!mn.length){ delete _patPrev[ms]; return; }
-          rows.push({sym:ms,n:mn.length}); total+=mn.length;
           var mcur=mn.slice().sort().join('|'), mprev=_patPrev[ms]||'';
           if(mprev){ var mpp={}; mprev.split('|').forEach(function(x){ if(x) mpp[x]=1; });
             for(var j=0;j<mn.length;j++){ if(!mpp[mn[j]]&&patFresh(ms,mn[j])) newN++; } }
@@ -4674,44 +4657,49 @@ def tech_multi_page():
           _patPrev[ms]=mcur;
         });
       });
-      _patRows=rows; _patTotal=total;
       if(newN>0) _patUnread+=newN;   // 已读模型: 累计自上次点球(已读)以来的新增条数
       patRender();
-      try{ patReport(); }catch(e){}
+      patSrvTick();                  // 有变动就尽快拉一次服务端聚合值(3s 内不重复)
       if(_ddSym) patDDRefresh();     // 月份下开着: 就地刷新各行数字与标题合计
       if(newN>0) patBeep();          // 只有【新增】才走提示音(响不响由 patPlay 的门禁决定)
     }
-    // 形态总数上报(2026-10-17 用户诉求"左侧模块与页面顶部没同步"):
-    //   导航徽标原口径=全局(DEFAULT 6+EXTRA 11+月份合约), 与页面顶部([LEFT]+RIGHT+子合约)
-    //   对不上(实测 45 vs 12)。这里每拍把页面口径 POST 给服务端, 徽标优先取页面值 ->
-    //   两边严格同源; 页面关闭后徽标保留最后值(age 增大, 网关侧自动提示"数据陈旧")。
-    //   值没变就跳过(500ms 节拍不刷请求); total=0 也上报, 保证徽标与页面同步归零。
-    var _patLastReport='';
-    function patReport(){
+    // ============ 形态总数单一数据源(2026-10-17) ============
+    // 唯一计算方法在服务端(_pat_total_refresh, 5s 一拍); 这里唯一取值口 = GET api/pattern_total。
+    // 顶栏徽标 / 悬浮球 / 预警明细(patDD) / 左侧导航徽章 四者共用同一份数据, 永远同数。
+    // 本页 patCheck 只做新增检测与响铃, 不碰总数(彻底消除历史上 45 vs 12 的双口径)。
+    var _patTotalSrv=0, _patSrvRows=[], _patSrvT0=0;
+    function patSrvTick(force){
       try{
-        var syms=[LEFT].concat(RIGHT), scope=syms.length;
-        syms.forEach(function(s){ scope += (_ddMonths[s]||[]).length; });
-        var payload=JSON.stringify({total:_patTotal, rows:_patRows, scope:scope});
-        if(payload===_patLastReport) return;
-        _patLastReport=payload;
-        fetch(apiBase()+'api/pattern_total',{method:'POST',headers:{'Content-Type':'application/json'},body:payload,cache:'no-store'}).catch(function(){});
+        var now=Date.now();
+        if(!force && now-_patSrvT0<3000) return;      // 3s 内不重复拉(patCheck 每拍都可能触发)
+        _patSrvT0=now;
+        fetch(apiBase()+'api/pattern_total',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+          if(!d||!d.ok) return;
+          var t=parseInt(d.total,10); if(isNaN(t)) t=0;
+          _patSrvRows=(d.rows||[]).map(function(r){
+            return {sym:r.sym, n:(parseInt(r.n,10)||0), name:(r.name||NAMES[r.sym]||r.sym)};
+          });
+          if(t!==_patTotalSrv || _patDDOpen){ _patTotalSrv=t; patRender(); }
+        }).catch(function(){});
       }catch(e){}
     }
+    setInterval(function(){ patSrvTick(true); }, 5000);   // 5s 一拍与服务端聚合同步
+    setTimeout(function(){ patSrvTick(true); }, 800);     // 首屏尽快出数
     function patRender(){
       var b=document.getElementById('patBadge'), ball=document.getElementById('patBall');
-      if(_patTotal<=0){
+      if(_patTotalSrv<=0){
         _patUnread=0;
         if(b) b.style.display='none';
         if(ball) ball.style.display='none';
         if(_patDDOpen){ _patDDOpen=false; patDDRender(); }
         return;
       }
-      if(b){ b.style.display=''; b.innerHTML='🔔 形态 <b>'+_patTotal+'</b>'
+      if(b){ b.style.display=''; b.innerHTML='🔔 形态 <b>'+_patTotalSrv+'</b>'
         +(_patUnread>0? ' <span class="patunread">+'+_patUnread+'</span>':''); }
       if(ball){
         ball.style.display='flex';
         ball.className=(_patFold?'fold':'')+(_patUnread>0?' unread':'');
-        ball.innerHTML=String(_patTotal)
+        ball.innerHTML=String(_patTotalSrv)
           +'<span id="patBallX" onclick="patBallFold(event)" title="'
           +(_patFold?'展开数量球':'收拢数量球(不是关闭, 新形态仍会提醒)')+'">×</span>';
       }
@@ -4732,10 +4720,10 @@ def tech_multi_page():
       if(!_patDDOpen){ dd.style.display='none'; return; }
       var html='<div class="pddt"><span>形态预警 · 各合约数量'+(_patUnread>0?'（新增 '+_patUnread+'）':'')+'</span>'
         +'<span class="pdtst" onclick="patTest(event)" title="试听提醒音（三声短响，不受静默门禁影响）">试听</span></div>';
-      if(!_patRows.length) html+='<div class="pdempty">当前无形态</div>';
-      else html+=_patRows.map(function(r){
-        var nm=NAMES[r.sym]||r.sym;
-        return '<div class="pdrow"><span>'+lvlEsc(nm)+'</span><b>'+r.n+'</b></div>';
+      // 明细直接渲染服务端 rows(与顶栏/悬浮球/导航徽章同一个接口的同一次快照), 不再本地拼
+      if(!_patSrvRows.length) html+='<div class="pdempty">当前无形态</div>';
+      else html+=_patSrvRows.map(function(r){
+        return '<div class="pdrow"><span>'+lvlEsc(r.name)+'</span><b>'+r.n+'</b></div>';
       }).join('');
       dd.innerHTML=html; dd.style.display='block';
     }
@@ -4825,9 +4813,6 @@ def register_routes(app, slots, default_key, get_slot=None, make_slot=None):
     app.add_url_rule("/stocktech/api/preload_priority", view_func=api_preload_priority, methods=["POST"], strict_slashes=False)
     app.add_url_rule("/stocktech/api/accounts", view_func=api_tech_accounts, methods=["GET"], strict_slashes=False)
     app.add_url_rule("/stocktech/api/pattern_total", view_func=api_pattern_total, methods=["GET"], strict_slashes=False)
-    # 页面上报通道(2026-10-17): 多标页 patCheck 每拍把当前页形态总数 POST 上来, 导航徽标优先取它
-    app.add_url_rule("/stocktech/api/pattern_total", view_func=api_pattern_total_report,
-                     endpoint="pattern_total_report", methods=["POST"], strict_slashes=False)
     app.add_url_rule("/stocktech/multi", view_func=tech_multi_page, methods=["GET"], strict_slashes=False)
     app.add_url_rule("/stocktech/multi/", view_func=tech_multi_page, methods=["GET"], strict_slashes=False)
     app.add_url_rule("/stocktech/static/<path:filename>", view_func=stock_serve_static, endpoint="stocktech_serve_static", methods=["GET"], strict_slashes=False)
