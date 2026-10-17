@@ -27,11 +27,18 @@ class MarketDataService:
         self.tick_cache = {}
 
     def get_realtime_quotes(self, symbols: List[str]) -> List[Dict]:
-        """获取多个合约的实时行情（调用前需先 wait_update）"""
+        """获取多个合约的实时行情（调用前需先 wait_update）
+
+        泵保护(2026-09-08): 只读已注册的 quote 缓存, 未注册的合约返回 error 条目。
+        绝不在此路径触发阻塞式注册 —— 原实现会对缓存未命中的合约直接调 api.get_quote
+        (同步等待首包, 单个最多 30s), 主泵快照 5568 个订阅时被逐个卡死 => 全站停更。"""
         results = []
         for symbol in symbols:
             try:
-                quote = self.client.get_quote(symbol)
+                quote = self.client.get_quote_cached(symbol)
+                if quote is None:
+                    results.append({"symbol": symbol, "error": "订阅未就绪"})
+                    continue
                 data = {
                     "symbol": symbol,
                     "name": quote.instrument_name if hasattr(quote, 'instrument_name') else symbol,
@@ -96,8 +103,11 @@ class MarketDataService:
         """获取K线数据并转为DataFrame（读取后台线程已拉取的历史数据）"""
         try:
             import traceback
-            # 1. 获取K线序列（不调用 wait_update，直接读已推送过来的数据）
-            kline = self.client.get_kline(symbol, duration_seconds, data_length)
+            # 1. 只读获取已建好的 K 线序列（绝不触发阻塞创建——本方法可能被请求线程调用,
+            #    阻塞式 get_kline_serial 会从请求线程等首包、与主线程泵并发跑同一事件循环 => 毁坏 loop）
+            kline = self.client.get_kline_cached(symbol, duration_seconds, data_length)
+            if kline is None:
+                return pd.DataFrame()
             
             # 2. 手动提取 OHLCV + datetime 数据
             closes, opens, highs, lows, volumes, datetimes = [], [], [], [], [], []

@@ -6,6 +6,34 @@ import threading, json, sys, traceback, math, time
 import html
 from urllib.parse import quote as _urlquote
 from datetime import datetime
+
+# 🔴 2026-10-14 编码兜底(必须在任何 print 之前):
+#   本项目 stdout 会被重定向到日志文件(start_all.bat / start_bg.bat), Windows 下
+#   该句柄默认 GBK 编码。日志里若出现 GBK 无法表示的字符(如 ✓/✗/⚠/emoji),
+#   print 会抛 UnicodeEncodeError, 打断业务流程 —— 实测导致 zhubajie 账户连接
+#   在 print 处崩溃 -> 期货监控 slot 永远拿不到 -> 全链路无数据入库。
+#   这里统一把 stdout/stderr 换成"遇到无法编码的字符用 ? 代替", 永不因字符崩业务。
+def _safe_stdio():
+    """把 stdout/stderr 设成 errors='replace'，任何无法编码的字符都不再抛异常。
+
+    🔴 2026-10-14 实测坑: 判据不能用"是否 utf8"来跳过 —— 实测本项目重定向到文件时
+       sys.stdout.encoding 已是 'utf-8' 但 errors 仍是 'strict'，于是 print 到
+       GBK 无法表示的字符(如 ×/emoji)照样抛 UnicodeEncodeError 并打断业务流程
+       (表现为 scheduler/自动监控 守护线程静默起不来)。因此这里**只统一 errors**,
+       编码保持原样。
+    """
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is None:
+            continue
+        try:
+            s.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+_safe_stdio()
+
 from flask import Flask, render_template_string, request, Response, jsonify
 from services import sync_service
 from services import option_greeks
@@ -553,15 +581,30 @@ WH_INDEX_SYMBOLS = ["KQ.m@SHFE.cu", "KQ.m@SHFE.rb", "KQ.m@DCE.i", "KQ.m@INE.sc",
                     "KQ.m@DCE.m", "KQ.m@CZCE.TA", "KQ.m@SHFE.au", "KQ.m@DCE.p",
                     "KQ.m@CZCE.MA", "KQ.m@SHFE.fu"]
 
+# 合约名称缓存(净值/快照到达时填充), 用于: ①自选列表无行情时也能显示合约中文名; ②悬浮 tooltip。
+_SYMBOL_NAME_CACHE = {}
+# 自选合约按账户隔离后, 每个 Slot 缓存自己的自选列表(30s TTL), 避免每次 poll_step 打 DB。
+_WATCH_CACHE_TTL = 30
+
 
 # ===== 账户Slot: 每个账户独立客户端 + 数据 + 轮询线程 =====
 class AccountSlot:
+    # 无权限/不存在标的的负缓存 TTL: 本会话内基本永久(权限运行期不变, 避免反复触发 get_kline_serial 慢路径卡死主线程)。
+    # connect() 重连时会清空, 由预热重新标记。
+    _KLINE_FAIL_TTL = 86400 * 365
+    # 单会话订阅合约数上限(2026-09-08): 实测被灌 5568 个订阅后天勤对整个会话限流,
+    # 收不到任何推送(含已订阅的 K 线/指数)。500 为保守安全值, 自选股优先(见分钟引擎)。
+    MAX_SLOT_SUBSCRIBE = 500
+
     def __init__(self, tq_user: str, tq_pass: str):
         self.tq_user = tq_user
         self.tq_pass = tq_pass
+        self.account_id = None       # 由 get_slot 解析并缓存(自选合约按账户隔离)
         self.client = None
         self.market = None
         self.latest_data = {}
+        self._watch_cache = None     # 自选列表缓存(30s TTL, 见 _get_watch_syms)
+        self._watch_cache_ts = 0
         self.data_lock = threading.Lock()
         self.status = "init"       # init | online | error
         self.error_msg = ""
@@ -572,54 +615,669 @@ class AccountSlot:
         self.subscribed = set()    # 常驻订阅集合(由轮询线程持续 wait_update 驱动)
         self._pending_sub = set()  # 待主线程 get_quote 的合约(请求线程只登记, 不直接 get_quote)
         self._sub_lock = threading.Lock()
+        # K线对象异步创建(主线程): worker 线程只登记请求, 真正 api.get_kline_serial 由
+        # poll_step 在主线程执行(满足 TqSdk 同线程约束)。规避"worker 线程并发 get_kline_serial
+        # 导致 TqSdk 订阅/数据交付全部失效 -> df=len=0"。
+        self._kline_pending = {}      # key(symbol,dur,cnt,end_dt) -> {"ev":Event,"obj":None}
+        self._kline_lock = threading.Lock()
+        self._kline_cache = {}        # 已建好的 KlineData 对象缓存(同一 key 复用, 数据由 wait_update 持续更新)
+        self._kline_failed = {}       # symbol -> 失效时间戳(负缓存: 无权限/不存在标的, 避免反复 graphql 报错拖垮主线程泵)
+        self._kline_deny = set()      # 持久黑名单(DB t_kline_deny): 已知会毒化会话的标的, 会话级绝不触碰
+        self._grant_rej_logged = set()  # 本地权限预检已记日志的合约(去重, 防刷屏)
 
     def ensure_subscribed(self, symbols):
         """请求线程调用：仅登记待订阅合约（不直接 get_quote）。
         关键：TqSdk 的 get_quote 必须在 TqApi 创建线程(主线程)调用才会真正发送订阅请求，
         否则行情不推送（实测请求线程 get_quote 仅 3/76 合约有行情, 主线程 75/76）。
-        真正 get_quote 由主线程订阅注册循环执行。"""
+        真正 get_quote 由主线程订阅注册循环执行。
+
+        会话订阅上限(2026-09-08 实锤): 单会话被灌入海量订阅(分钟引擎全 A 股 5568 只)时,
+        天勤对该会话限流 —— 整个会话收不到任何数据推送, 连已订阅的 K 线/指数行情一起冻死
+        (泵 got=False, 页面数据纹丝不动)。故设上限, 超限直接跳过, 保住会话推送能力。"""
         if self.client is None or self.client.api is None:
             return
         with self._sub_lock:
             for s in symbols:
-                if s not in self.subscribed:
-                    self._pending_sub.add(s)
-                    self.subscribed.add(s)
+                if s in self.subscribed:
+                    continue
+                if len(self.subscribed) >= self.MAX_SLOT_SUBSCRIBE:
+                    if not getattr(self, "_sub_cap_logged", False):
+                        self._sub_cap_logged = True
+                        print(f"[订阅] {self.tq_user} 会话订阅数已达上限({self.MAX_SLOT_SUBSCRIBE}), "
+                              f"后续合约跳过(防止会话被天勤限流冻死)", flush=True)
+                    continue
+                self._pending_sub.add(s)
+                self.subscribed.add(s)
+
+    def _get_watch_syms(self):
+        """返回本账户自选合约列表(带 30s 缓存, 避免每次 poll_step 打 DB)。
+        无 account_id 或查询失败回退默认合约。"""
+        if not getattr(self, "account_id", None):
+            return []
+        import time as _t
+        now = _t.time()
+        cached = getattr(self, "_watch_cache", None)
+        ts = getattr(self, "_watch_cache_ts", 0)
+        if cached is not None and (now - ts) < _WATCH_CACHE_TTL:
+            return cached
+        try:
+            from services import futures_db
+            syms = futures_db.get_watchlist_symbols(self.account_id, seed=DEFAULT_SYMBOLS)
+        except Exception:
+            syms = list(DEFAULT_SYMBOLS)
+        self._watch_cache = syms
+        self._watch_cache_ts = now
+        return syms
 
     def connect(self):
         """连接天勤(仅调用一次)。TqApi 必须在创建它的同一线程里调用 wait_update，
-        因此轮询不再单独开线程，而是由主线程的订阅注册循环驱动。"""
+        因此每个 Slot 都在自己的专属线程(_run)里创建 TqApi 并驱动 wait_update,
+        绝不把多个 TqApi 塞进同一个事件循环(否则后建的会话会被饿死、永远收不到行情包)。"""
         if self.status != "init":
             return
+        # 重连/新连接时清空旧的 K 线对象缓存(旧 api 已失效, 持有会读到空/旧数据)
+        with self._kline_lock:
+            self._kline_pending.clear()
+            self._kline_cache.clear()
+            self._kline_failed.clear()
         self.status = "connecting"
         try:
             self.client = TqSdkClient(self.tq_user, self.tq_pass)
             self.market = MarketDataService(self.client)
             self.status = "online"
-            print(f"[账户:{self.tq_user}] ✓ 连接成功")
+            # 加载本账户的"毒化标的"持久黑名单: 这些标的的 get_kline_serial 会打死整条会话,
+            # 必须在任何 K 线请求下发前就位(黑名单由独立探测会话预热 + 运行时失败自动补充)。
+            self._load_kline_deny()
+            print(f"[账户:{self.tq_user}] [OK] 连接成功")
         except Exception as e:
             self.status = "error"
             self.error_msg = str(e)
-            print(f"[账户:{self.tq_user}] ✗ 连接失败: {e}")
+            # 🔴 2026-10-14 修复: 禁用非 GBK 字符(✗/✓)。本项目输出会被重定向到日志文件,
+            #   Windows 下 stdout 编码为 GBK, 打印这些字符会抛 UnicodeEncodeError,
+            #   连带打断连接流程 -> 账户永远 error -> 期货监控 slot 拿不到 -> 全链路不入库。
+            #   统一改用 ASCII 符号, 保证任何编码环境都能打印。
+            print(f"[账户:{self.tq_user}] [X] 连接失败: {e}", flush=True)
+
+    def start(self):
+        """启动本账户专属的行情泵线程: 在【本线程内】创建 TqApi(获得独立事件循环),
+        随后 connect -> startup_poll -> 循环 poll_step。多个账户各自独立线程, 互不抢循环。"""
+        if getattr(self, "_thread_started", False):
+            return
+        self._thread_started = True
+        self._stop = False
+        t = threading.Thread(target=self._run, name=f"slot-{self.tq_user}", daemon=True)
+        t.start()
+
+    def _run(self):
+        """账户专属泵线程主循环(本线程 = TqApi 创建线程 = wait_update 调用线程)。"""
+        import time as _t
+        while not self._stop:
+            try:
+                if self.status == "online":
+                    # 静默自愈: 天勤会话偶发"连上了但永不推包"(距上次收包=-1s), 且不会自愈。
+                    # 实锤(2026-09-09): Mr qia 的槽线程活着、订阅 89 个合约, 却 got=False/从未收包;
+                    # 同一账号在独立进程开全新会话则 1911/1911 全部正常收包。故检测到静默就重开会话。
+                    self._maybe_reconnect_on_silence()
+                    if self.status != "online":
+                        continue
+                    self.poll_step()
+                elif self.status == "init":
+                    self.connect()
+                    if self.status == "online":
+                        try:
+                            self.startup_poll()
+                        except Exception as _e:
+                            print(f"[账户:{self.tq_user}] 预加载异常: {_e}", flush=True)
+                elif self.status == "expired":
+                    _t.sleep(5)   # 已过期/禁用: 不重连, 等 _expired_slot_reaper 改回 init
+                elif self.status == "error":
+                    # 轻量重连: 每 300s 重试一次(应对临时网络/限流/天勤 trial 短暂不可用)
+                    if not _account_is_valid(self.tq_user):
+                        self.status = "expired"
+                        continue
+                    if _t.time() - getattr(self, "_last_err_try", 0) > 300:
+                        self._last_err_try = _t.time()
+                        print(f"[账户:{self.tq_user}] 尝试重连...", flush=True)
+                        self.connect()
+                        if self.status == "online":
+                            try:
+                                self.startup_poll()
+                            except Exception:
+                                pass
+                    else:
+                        _t.sleep(5)
+                else:
+                    _t.sleep(1)
+            except Exception as _e:
+                print(f"[账户:{self.tq_user}] 槽线程异常(已忽略): {_e}", flush=True)
+                _t.sleep(2)
+
+    def _load_kline_deny(self):
+        """从 DB 载入本账户的 K 线毒化黑名单(t_kline_deny)。"""
+        try:
+            from services import futures_db
+            aid = getattr(self, "account_id", None)
+            if aid is None:
+                aid = futures_db.get_account_id_by_tq_user(self.tq_user)
+                self.account_id = aid
+            if aid:
+                self._kline_deny = futures_db.get_kline_deny(aid) or set()
+                if self._kline_deny:
+                    print(f"[K线黑名单] {self.tq_user} 已加载 {len(self._kline_deny)} 个毒化标的: "
+                          f"{sorted(self._kline_deny)[:6]}{'...' if len(self._kline_deny) > 6 else ''}", flush=True)
+        except Exception as _e:
+            print(f"[K线黑名单] 加载失败(忽略): {_e}", flush=True)
+
+    def _deny_kline_symbol(self, symbol, reason=""):
+        """把一个会毒化会话的标的写入负缓存 + DB 黑名单。"""
+        try:
+            self._kline_failed[symbol] = time.time() + AccountSlot._KLINE_FAIL_TTL
+        except Exception:
+            pass
+        try:
+            self._kline_deny.add(symbol)
+            from services import futures_db
+            aid = getattr(self, "account_id", None)
+            if aid:
+                futures_db.add_kline_deny(aid, symbol, reason)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _market_open_now():
+        """A股日盘 + 期货夜盘 盘中判定(本地时区, 服务器 GMT+8)。
+
+        用于静默自愈阈值: 盘中才积极重连; 休市期天勤本就不推包, 强行重连只会
+        徒增抖动(见 MEMORY '会话静默自愈')。节假日未排除(极少见, 可接受)。"""
+        import time as _t
+        now = _t.localtime()
+        if now.tm_wday >= 5:        # 周六/日 休市
+            return False
+        h, m = now.tm_hour, now.tm_min
+        day1 = (h == 9 and m >= 30) or (h == 10) or (h == 11 and m <= 30)
+        day2 = (h == 13) or (h == 14) or (h == 15 and m == 0)
+        night = (h == 21) or (h == 22) or (h == 23) or (h in (0, 1)) or (h == 2 and m <= 30)
+        return day1 or day2 or night
+
+    def _maybe_reconnect_on_silence(self):
+        """长会话静默自愈(2026-09-14 改为盘中积极、休市免打扰)。
+
+        判定(仅当市场开盘时生效):
+          ① 从未收到过任何包(_last_got==0)且已轮询 >=10 次(约30s) —— 真故障兜底, 始终生效;
+          ② 曾收到过包, 但距上次收包 > 25s(正常行情每 3s 一拍, 25s 足够灵敏)。
+        保护: 重连冷却 45s, 避免静默期反复重开打爆天勤。
+        休市期(周末/夜间): 天勤本就不推包, 直接 return —— 不判静默、不重连,
+        避免每~100s 空转重连导致每请求退化 1~2s(见 MEMORY)。
+        """
+        import time as _t
+        now = _t.time()
+        # ===== [2026-09-21] 外部(筛选跑批)申请重开会话: 不受开盘判定/45s 冷却限制, 优先执行 =====
+        _want = getattr(self, "_want_reconnect", "")
+        if _want:
+            self._want_reconnect = ""
+            self._last_reconnect = now
+            print(f"[账户:{self.tq_user}] 主动重开会话({_want})", flush=True)
+            self._do_reconnect()
+            return
+        if not self._market_open_now():
+            return
+        last = getattr(self, "_last_got", 0) or 0
+        cnt = getattr(self, "_poll_cnt", 0)
+        never = (last == 0 and cnt >= 10)
+        silent = (last > 0 and (now - last) > 25)
+        if not (never or silent):
+            return
+        if now - getattr(self, "_last_reconnect", 0) < 45:
+            return
+        self._last_reconnect = now
+        _ago = int(now - last) if last else -1
+        print(f"[账户:{self.tq_user}] [!] 会话静默(轮询{cnt}次/距上次收包={_ago}s), 主动重开会话...", flush=True)
+        self._do_reconnect()
+
+    def force_reconnect(self, reason="释放K线序列"):
+        """[2026-09-21] 申请重开会话 —— 只登记标志, 实际由主线程 _maybe_reconnect_on_silence 执行。
+
+        为什么不就地重开: worker(筛选跑批)线程若直接 client.close(), 会打断主线程正在跑的
+        wait_update; 而 _maybe_reconnect_on_silence 就在主循环里被调用, 由它统一执行最安全。
+        用途: 天勤单会话可容纳的 K 线序列数有限(全市场实测约 500 只后 set_chart 不再回数据),
+        筛选跑批必须分块重开会话把 chart 释放掉。
+        """
+        self._want_reconnect = reason or "手动请求"
+
+    def _do_reconnect(self):
+        """关闭当前 TqApi 会话并清空一切派生状态, 交给 _run 下一轮 init->connect(主线程调用)。"""
+        # 1) 关闭旧会话(失败也要继续, 不能卡死)
+        try:
+            if self.client is not None:
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 2) 清空该会话派生的一切状态(订阅/快照/K线对象缓存), 交给 _run 下一轮重新 init->connect
+        self.client = None
+        self.market = None
+        self.status = "init"
+        try:
+            with self._sub_lock:
+                self.subscribed.clear()
+                self._pending_sub.clear()
+        except Exception:
+            pass
+        try:
+            with self.data_lock:
+                self.latest_data.clear()
+        except Exception:
+            pass
+        try:
+            with self._kline_lock:
+                self._kline_pending.clear()
+                self._kline_cache.clear()
+                self._kline_failed.clear()
+        except Exception:
+            pass
+        self._poll_cnt = 0
+        self._last_got = 0
 
     def _register_pending(self):
-        """在主线程(TqApi 创建线程)里把请求线程登记的待订阅合约真正注册到天勤。"""
+        """在主线程(TqApi 创建线程)里把请求线程登记的待订阅合约真正注册到天勤。
+
+        泵保护(2026-09-08, 实锤根因): 无数据/超限会话下, TqSdk 原生 get_quote 同步等
+        首包(固定 30s 超时), 分钟引擎把全 A 股宇宙(5568 只)灌进待注册队列后, 逐个同步
+        注册把主泵冻死十几分钟 => 全站行情/K线停更("时间在走、数据不动")。
+        修复: ① 每轮最多 20 个(剩余放回队列防丢单); ② 本地权限预检(_has_md_grants,
+        零网络), 被拒的直接跳过(防止毒化整批 QuoteList 任务); ③ 批量异步注册(一个
+        QuoteList 只发一次 subscribe_quote, 避免逐个注册反复重发全量 ins_list 洪泛),
+        不等待首包 —— 数据由泵的 wait_update 自然驱动送达, 泵零阻塞。"""
         if self.client is None or self.client.api is None:
             return
         with self._sub_lock:
             pending = list(self._pending_sub)
             self._pending_sub.clear()
-        for sym in pending:
+        # 合并 worker 线程经 client.get_quote 登记的待注册合约(同样受订阅上限约束)
+        extra = self.client.drain_pending_quotes()
+        if extra:
+            with self._sub_lock:
+                for s in extra:
+                    if s in self.subscribed:
+                        continue
+                    if len(self.subscribed) >= self.MAX_SLOT_SUBSCRIBE:
+                        continue
+                    self.subscribed.add(s)
+                    pending.append(s)
+        if not pending:
+            return
+        batch, rest = pending[:20], pending[20:]
+        # 本地权限预检: 被拒合约跳过(同一会话内不会重复登记, 日志去重)
+        ok_syms = []
+        auth = getattr(self.client.api, "_auth", None)
+        for sym in batch:
+            if auth is not None and hasattr(auth, "_has_md_grants"):
+                try:
+                    auth._has_md_grants([sym])
+                except Exception as e:
+                    if sym not in self._grant_rej_logged:
+                        self._grant_rej_logged.add(sym)
+                        print(f"[订阅] {self.tq_user} 跳过无权限合约 {sym}: {str(e)[:50]}", flush=True)
+                    continue
+            ok_syms.append(sym)
+        if ok_syms:
             try:
-                self.client.get_quote_main_thread(sym)
+                _, fails = self.client.register_quotes_async(ok_syms)
+                if fails:
+                    # 整批失败(订阅任务毒化/异常): 全部移出 subscribed 允许后续重试
+                    for sym in ok_syms:
+                        with self._sub_lock:
+                            self.subscribed.discard(sym)
+                    if not getattr(self, "_sub_fail_logged", False):
+                        self._sub_fail_logged = True
+                        print(f"[订阅] {self.tq_user} 批量注册异常: {fails[0][1] if fails else ''}", flush=True)
+            except Exception as e:
+                print(f"[订阅] {self.tq_user} 批量注册失败({len(ok_syms)}个): {str(e)[:60]}", flush=True)
+                with self._sub_lock:
+                    for sym in ok_syms:
+                        self.subscribed.discard(sym)
+        if rest:
+            with self._sub_lock:
+                self._pending_sub.update(rest)
+
+    def request_kline_obj(self, symbol, duration, count, end_dt=None):
+        """Worker 线程调用: 登记 K 线对象创建请求(真正创建在 poll_step 主线程),
+        阻塞等待主线程建好对象后返回。返回 KlineData 对象或 None。
+
+        关键: TqSdk 要求 get_kline_serial 与 wait_update 在同一(TqApi 创建)线程调用。
+        原先 worker 线程直接调 api.get_kline_serial, 多标的并发时订阅注册被并发竞态破坏,
+        导致全部标的 df=len=0。改为 worker 只登记, 主线程 poll_step 统一创建, 彻底规避。
+        """
+        if self.client is None or self.client.api is None:
+            return None
+        # ===== 持久黑名单: 已知会毒化会话的标的, 一律不下发天勤 =====
+        if symbol in self._kline_deny:
+            return None
+        # ===== 本地权限预检(零网络): 无权限标的绝不下发天勤 =====
+        # 实锤根因(2026-09-09): 技术分析页以 Mr qia 身份每 3s 批量请求 A 股 K 线
+        # (SSE.000852/000300/000001/000016/SZSE.399006/SSE.000688), 而该账户无 A 股权限。
+        # 每次 get_kline_serial 都会毒化整条会话 -> 天勤从此不再推送任何包 ->
+        # 连期货 K 线也全空(轮询 got=False/距上次收包=-1s), 且重开会话后被立刻再次毒化。
+        # zhubajie 不是扫描账号、从不查 A 股, 故会话干净 got=True —— 这就是两账户表现迥异的原因。
+        _auth = getattr(self.client.api, "_auth", None)
+        if _auth is not None and hasattr(_auth, "_has_md_grants"):
+            try:
+                _auth._has_md_grants([symbol])
+            except Exception:
+                with self._kline_lock:
+                    self._kline_failed[symbol] = time.time() + AccountSlot._KLINE_FAIL_TTL
+                return None
+        key = (symbol, duration, count, end_dt)
+        with self._kline_lock:
+            # 负缓存: 已知无权限/不存在的标的, 直接返回 None, 不再到主线程反复 graphql 报错(会拖垮泵)。
+            # 命中即续期(本会话内基本永久), 避免被反复请求期间静默过期、再次触发 get_kline_serial 慢路径(曾导致 ~20s 卡死)。
+            if symbol in self._kline_failed:
+                if self._kline_failed[symbol] > time.time():
+                    self._kline_failed[symbol] = time.time() + AccountSlot._KLINE_FAIL_TTL
+                    return None
+                del self._kline_failed[symbol]  # 已过期: 移除, 走正常创建流程(会再次失败并重新标记)
+            cached = self._kline_cache.get(key)
+            if cached is not None:
+                return cached
+            pend = self._kline_pending.get(key)
+            if pend is None:
+                pend = {"ev": threading.Event(), "obj": None}
+                self._kline_pending[key] = pend
+        # 最多等 5s(主线程下一轮 poll_step 即处理, 通常 <1s)
+        pend["ev"].wait(timeout=5.0)
+        return pend["obj"]
+
+    def request_kline_objs_batch(self, specs, wait=25.0):
+        """[2026-09-21 筛选提速] 批量登记 K 线对象创建请求, 统一等待。
+
+        与 request_kline_obj 的差别只在"等"的组织方式: 一次性把 N 个
+        (symbol, duration, count, end_dt) 全登记进 _kline_pending, 主线程下一轮
+        poll_step 会在【同一轮】把 N 个对象全部建出来, 天勤的往返因此重叠 ——
+        全市场逐只串行取数(实测 ≈3.2s/只) 降为批量摊薄。登记/等待语义与单发一致,
+        不改变 request_kline_obj 行为。
+
+        返回 {(symbol, duration, count, end_dt): obj or None}
+        """
+        specs = list(specs or [])
+        if not specs:
+            return {}
+        if self.client is None or self.client.api is None:
+            return {sp: None for sp in specs}
+        out = {}
+        pends = []
+        with self._kline_lock:
+            for sp in specs:
+                symbol, duration, count, end_dt = sp
+                # 持久黑名单: 已知毒化会话的标的, 一律不下发天勤
+                if symbol in self._kline_deny:
+                    out[sp] = None
+                    continue
+                key = (symbol, duration, count, end_dt)
+                cached = self._kline_cache.get(key)
+                if cached is not None:
+                    out[sp] = cached
+                    continue
+                # 负缓存: 无权限/不存在的标的直接跳过(命中即续期, 与单发一致)
+                if symbol in self._kline_failed:
+                    if self._kline_failed[symbol] > time.time():
+                        self._kline_failed[symbol] = time.time() + AccountSlot._KLINE_FAIL_TTL
+                        out[sp] = None
+                        continue
+                    del self._kline_failed[symbol]
+                pend = self._kline_pending.get(key)
+                if pend is None:
+                    pend = {"ev": threading.Event(), "obj": None}
+                    self._kline_pending[key] = pend
+                pends.append((sp, key, pend))
+        deadline = time.time() + max(2.0, float(wait))
+        for sp, key, pend in pends:
+            left = deadline - time.time()
+            if left > 0:
+                pend["ev"].wait(timeout=left)
+            out[sp] = pend["obj"]
+        return out
+
+    def _process_kline_pending(self):
+        """主线程(poll_step)调用: 把 worker 登记的 K 线请求真正用 api.get_kline_serial 创建。"""
+        items = []
+        with self._kline_lock:
+            if self._kline_pending:
+                items = list(self._kline_pending.items())
+                self._kline_pending.clear()
+        for key, pend in items:
+            symbol, duration, count, end_dt = key
+            # 权限预检(本地, 零网络): 无权限标的直接负缓存, 绝不走 get_kline_serial 同步等首包
+            # (等首包循环运行期会长时间占用主线程泵 => 全站行情/K线冻死; 2026-09-08 实锤)。
+            auth = getattr(self.client.api, "_auth", None)
+            if auth is not None and hasattr(auth, "_has_md_grants"):
+                try:
+                    auth._has_md_grants([symbol])
+                except Exception as e:
+                    self._kline_failed[symbol] = time.time() + AccountSlot._KLINE_FAIL_TTL
+                    if symbol not in getattr(self, "_kline_rej_logged", set()):
+                        self._kline_rej_logged = getattr(self, "_kline_rej_logged", set())
+                        self._kline_rej_logged.add(symbol)
+                        print(f"[K线] 跳过无权限标的 {symbol}: {str(e)[:50]}", flush=True)
+                    pend["obj"] = None
+                    pend["ev"].set()
+                    continue
+            # 非阻塞创建: 立即返回 df(初始为空), 数据由泵 wait_update 送达, 绝不冻泵
+            try:
+                obj = self.client.get_kline_nonblocking(symbol, duration, count)
+                pend["obj"] = obj
+                if obj is not None:
+                    self._kline_cache[key] = obj
+            except Exception as e:
+                estr = str(e)
+                # 这些失败都会毒化整条会话(此后不再推任何包), 必须写持久黑名单, 后续会话直接跳过
+                if ("non-existent instrument" in estr or "不支持" in estr
+                        or "查询合约服务报错" in estr or "超时" in estr or "Timeout" in estr):
+                    self._deny_kline_symbol(symbol, estr[:120])
+                    print(f"[K线] 标的已加入毒化黑名单(后续会话跳过) {symbol}: {estr[:70]}", flush=True)
+                else:
+                    print(f"[K线] 主线程创建对象失败 {symbol} dur={duration}: {estr[:80]}")
+                pend["obj"] = None
+            pend["ev"].set()
+        # 处理完一批 pending 后给天勤一个 tick 消化(避免堆积), 仍受 poll_step 自身 wait_update 兜底
+        if items:
+            try:
+                self.client.api.wait_update(deadline=time.time() + 0.3)
             except Exception:
                 pass
+
+    def _enqueue_tech_klines(self):
+        """把技术分析所需的 K 线对象排队, 由 poll_step 每轮限量创建(渐进式, 不冲击会话)。
+
+        替代原 _precreate_tech_klines(启动时一次性建 30 个)。原因见 startup_poll 处说明。
+        """
+        try:
+            from services.stock_tech import DEFAULT_INSTRUMENTS, TECH_PERIODS
+            from services import futures_kline as _fk
+        except Exception:
+            return
+        q = []
+        for inst in DEFAULT_INSTRUMENTS:
+            sym = inst["symbol"]
+            if (inst.get("src") or "tq") == "tx":
+                continue  # HTTP 源标的(如科创50)不走天勤, 不预建 K 线(否则白撞一次"合约不存在")
+            if sym in self._kline_deny or sym in self._kline_failed:
+                continue
+            for _key, _label, dur, cnt in TECH_PERIODS:
+                # A股/指数 60m 由 30m 合成(kline_source_spec), 预热必须与取数用同一 key,
+                # 否则同一个源序列会被建成两份。
+                src_dur, src_cnt = _fk.kline_source_spec(sym, dur, cnt)
+                k = (sym, src_dur, src_cnt, None)
+                if k in self._kline_cache:
+                    continue
+                q.append(k)
+        self._tech_queue = q
+        if q:
+            print(f"[技术分析] 已排队 {len(q)} 个 K线对象(渐进创建, 每轮限量避免压垮会话)", flush=True)
+
+    def _process_tech_queue(self, limit=2):
+        """每轮最多创建 limit 个排队中的技术分析 K 线对象。"""
+        q = getattr(self, "_tech_queue", None)
+        if not q:
+            return
+        done = 0
+        while q and done < limit:
+            sym, dur, cnt, _end = q.pop(0)
+            if sym in self._kline_deny or sym in self._kline_failed:
+                continue
+            try:
+                obj = self.client.get_kline_nonblocking(sym, dur, cnt)
+                if obj is not None:
+                    self._kline_cache[(sym, dur, cnt, None)] = obj
+            except Exception as e:
+                estr = str(e)
+                if ("non-existent instrument" in estr or "不支持" in estr
+                        or "查询合约服务报错" in estr or "超时" in estr or "Timeout" in estr):
+                    self._deny_kline_symbol(sym, estr[:120])
+                    print(f"[技术分析] 跳过毒化标的 {sym}: {estr[:60]}", flush=True)
+            done += 1
+        if not q:
+            print(f"[技术分析] K线对象渐进创建完成(共 {len(self._kline_cache)} 个就绪)", flush=True)
+
+    def _precreate_tech_klines(self):
+        """[已废弃] 启动时一次性预建 —— 会压垮会话, 保留仅供回溯, 不再被调用。"""
+        """主线程(startup_poll: init→online 时仅跑一次)一次性顺序预建技术分析所需的 K 线对象。
+
+        必须在 TqApi 创建线程内、且在 pump 循环(poll_step)开始前调用——满足 TqSdk get_kline_serial
+        同线程约束, 且此时阻塞是允许的、确定性的(不会冻死运行中的主泵)。
+        顺序 + 每个之间 wait_update 一个 tick, 避免并发/连续 get_kline_serial 阻塞主线程泵
+        (曾因在 poll_step 热路径里连续建同标的多周期而卡死主泵, 导致全部标的 df=len=0)。
+        预建完成后, 页面请求直接命中 _kline_cache 秒级返回, 永不触发并发订阅竞态。"""
+        try:
+            from services.stock_tech import DEFAULT_INSTRUMENTS, TECH_PERIODS
+        except Exception:
+            return
+        import time as _t
+        created = 0
+        _auth = getattr(getattr(self.client, "api", None), "_auth", None)
+        for inst in DEFAULT_INSTRUMENTS:
+            sym = inst["symbol"]
+            if sym in self._kline_failed:
+                continue  # 已知无权限/不存在: 跳过整标的
+            # 本地权限预检(零网络): 无权限标的绝不 get_kline_serial, 否则会毒化整条会话
+            # (天勤此后不再推送任何包 -> 期货行情/K线全空)。见 request_kline_obj 同款说明。
+            if _auth is not None and hasattr(_auth, "_has_md_grants"):
+                try:
+                    _auth._has_md_grants([sym])
+                except Exception:
+                    self._kline_failed[sym] = _t.time() + AccountSlot._KLINE_FAIL_TTL
+                    print(f"[技术分析] 预建跳过无权限标的 {sym}", flush=True)
+                    continue
+            for key, label, dur, cnt in TECH_PERIODS:
+                kkey = (sym, dur, cnt, None)
+                if kkey in self._kline_cache:
+                    created += 1
+                    continue
+                try:
+                    obj = self.client.get_kline(sym, dur, cnt)
+                    if obj is not None:
+                        self._kline_cache[kkey] = obj
+                        created += 1
+                    # 给天勤一个 tick 消化该查询, 防止连续 get_kline_serial 阻塞主线程泵
+                    try:
+                        self.client.api.wait_update(deadline=_t.time() + 0.3)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    estr = str(e)
+                    if "non-existent instrument" in estr or "不支持" in estr or "查询合约服务报错" in estr:
+                        self._kline_failed[sym] = _t.time() + AccountSlot._KLINE_FAIL_TTL
+                        print(f"[技术分析] 预建跳过无权限标的 {sym}", flush=True)
+                        break  # 该标的所有周期均无权限, 跳出周期循环
+                    else:
+                        print(f"[技术分析] 预建 {sym} {label} 失败: {estr[:80]}", flush=True)
+        print(f"[技术分析] 启动预建 K 线完成: {created} 个对象就绪", flush=True)
 
     def startup_poll(self):
         """主线程调用：启动时一次性预加载 K 线、注册默认订阅、订阅 tick 序列。"""
         import time
         if self.client is None or self.client.api is None:
             return
+        # 锚定订阅(2026-09-08 实锤根因修复): 官方 get_quote 同步等首包(≤30s), 激活本会话的
+        # quote 推送通道。此前用 TqSdk 内部 QuoteList 裸创建订阅任务作为【会话首批订阅】时,
+        # 任务未被事件循环真正调度发出 subscribe_quote => 服务器从未收到订阅 => 整个会话
+        # got=False、任何标的收不到快照(全站行情/K线无数据, futureskline quotes n=0)。
+        # 官方 get_quote 会同步驱动订阅完成并等到首包(收盘后亦立即返回收盘快照), 100% 可靠;
+        # 锚定成功后同一会话的后续订阅(含 QuoteList/批量注册)均正常送达。
+        try:
+            anchor = list(DEFAULT_SYMBOLS)[0] if DEFAULT_SYMBOLS else "KQ.m@SHFE.cu"
+            self.client.get_quote_main_thread(anchor)  # 官方同步, 内部等首包
+            print(f"[账户:{self.tq_user}] [OK] 锚定订阅 {anchor} 成功(行情通道已激活)", flush=True)
+        except Exception as e:
+            print(f"[账户:{self.tq_user}] [X] 锚定订阅失败: {str(e)[:90]} (实时行情可能不可用)", flush=True)
+        # 期货主连预注册(2026-09-08 二次实锤): 必须赶在【K线预加载/预建洪流之前】用官方
+        # get_quote 逐个注册。会话"干净期"每个 0.1~0.5s 秒回(与独立探针一致, 100% 可达);
+        # 一旦先跑了大量 get_kline_serial 下载, 该会话新增 quote 订阅即不被服务器响应
+        # (官方逐个会卡 30s 超时、QuoteList 则静默) => 期货K线 quotes 全空。
+        # 预注册完成后页面请求直接命中缓存; 45s 保护防止罕见超时拖垮启动。
+        try:
+            from services.futures_kline import _get_main_contracts
+            mains = [x[0] for x in _get_main_contracts()]
+        except Exception:
+            mains = []
+        _t_pre = time.time()
+        _reg_ok = 0
+        for sym in mains:
+            if self._stop:
+                break
+            if time.time() - _t_pre > 45:
+                print(f"[账户:{self.tq_user}] 主连预注册超45s保护中止({_reg_ok}/{len(mains)})", flush=True)
+                break
+            with self._sub_lock:
+                if sym in self.subscribed:
+                    _reg_ok += 1
+                    continue
+            if self.client._quotes.get(sym) is not None:
+                _reg_ok += 1
+                continue
+            try:
+                self.client.get_quote_main_thread(sym)
+                with self._sub_lock:
+                    self.subscribed.add(sym)
+                _reg_ok += 1
+            except Exception as e:
+                _err = str(e)
+                print(f"[账户:{self.tq_user}] 主连预注册失败 {sym}: {_err[:60]}", flush=True)
+                if "超时" in _err or "Timeout" in _err:
+                    print(f"[账户:{self.tq_user}] 预注册出现超时, 中止后续({_reg_ok}/{len(mains)})", flush=True)
+                    break
+        if mains:
+            print(f"[账户:{self.tq_user}] [OK] 期货主连预注册 {_reg_ok}/{len(mains)}", flush=True)
+        # 2026-09-20 需求(期货行情页快速出数): 主连预注册刚完成, 立刻落地一次主连快照到缓存。
+        # 本函数后续的 K 线预加载(失败会重试 3 次 × 3s, 休市/无权限时白等)与订阅收尾会把
+        # poll_step 挡在后面, 这期间 latest_data 恒为空 -> "期货行情"页读到空表,
+        # 表现为"每次点进去要等好久才出数据"。先落一次快照, 后续 poll_step 继续增量更新;
+        # 不改变任何订阅时序约定(get_realtime_quotes 只读已注册的 quote 缓存, 不触发阻塞注册)。
+        try:
+            # 先推进一次事件循环: 刚注册的主连 quote 需要一次 wait_update 才会被推送填上字段值,
+            # 否则此处快照的 last_price 多为 0(实测首个会话仅 3/87 就绪), 预热形同虚设。
+            try:
+                self.client.api.wait_update(deadline=time.time() + 1.5)
+            except Exception:
+                pass
+            with self._sub_lock:
+                _subs_now = set(self.subscribed)
+            _warm_syms = [s for s in mains if s in _subs_now]
+            if _warm_syms:
+                _wqs = self.market.get_realtime_quotes(_warm_syms)
+                _wn = 0
+                with self.data_lock:
+                    for _q in _wqs:
+                        if "error" not in _q and _q.get("last_price", 0) > 0:
+                            self.latest_data[_q["symbol"]] = _q
+                            _qnm = _q.get("name")
+                            if _qnm:
+                                _SYMBOL_NAME_CACHE[_q["symbol"]] = _qnm
+                            _wn += 1
+                print(f"[账户:{self.tq_user}] [OK] 期货主连快照预热 {_wn}/{len(_warm_syms)}", flush=True)
+        except Exception as _we:
+            print(f"[账户:{self.tq_user}] 期货主连快照预热失败(忽略): {_we}", flush=True)
         # 预加载K线
         retry = 0
         while retry < 3 and not self._stop:
@@ -629,7 +1287,7 @@ class AccountSlot:
                 self.client.api.wait_update(deadline=time.time() + 5)
                 sample = self.market.get_kline_data(DEFAULT_SYMBOLS[0], 86400, 200)
                 if not sample.empty and len(sample) > 0:
-                    print(f"[账户:{self.tq_user}] ✓ K线预加载完成 {len(sample)} 条")
+                    print(f"[账户:{self.tq_user}] [OK] K线预加载完成 {len(sample)} 条")
                     break
             except Exception as e:
                 print(f"[账户:{self.tq_user}] K线预加载失败: {e}")
@@ -641,32 +1299,59 @@ class AccountSlot:
         # 订阅 tick 序列, 用于现手 / 外盘 / 内盘
         try:
             self.market.subscribe_ticks(DEFAULT_SYMBOLS)
-            print(f"[账户:{self.tq_user}] ✓ 已订阅 {len(DEFAULT_SYMBOLS)} 个合约的 tick 序列", flush=True)
+            print(f"[账户:{self.tq_user}] [OK] 已订阅 {len(DEFAULT_SYMBOLS)} 个合约的 tick 序列", flush=True)
         except Exception as e:
             print(f"[账户:{self.tq_user}] tick 订阅失败: {e}", flush=True)
         print(f"[账户:{self.tq_user}] 已订阅 {len(self.subscribed)} 个合约, 开始轮询...", flush=True)
+        # 技术分析模块: 若本 Slot 是扫描账号(有 A 股/指数权限), 启动时顺序预建 K 线对象
+        # (必须在 pump 循环开始前、主线程内确定性完成, 避免并发订阅竞态/冻泵)
+        try:
+            import services.stock_kline as _sk
+            if self.tq_user == _sk.get_scan_account():
+                # 2026-09-09 实锤: 启动时一次性预建 30 个 A股 K线对象(5标的×6周期)会压垮会话
+                # -> 该会话此后不再推送任何包(轮询 got=False/距上次收包=-1s), 连期货K线也全空。
+                # 改为【渐进创建】: 启动时只排队, 由 poll_step 每轮限量创建, 平滑不冲击会话。
+                self._enqueue_tech_klines()
+        except Exception as _e:
+            print(f"[技术分析] 预建触发异常(忽略): {_e}", flush=True)
 
     def poll_step(self):
-        """主线程调用：执行一次 wait_update + 注册待订阅合约 + 快照缓存。
-        这样 wait_update 始终运行在 TqApi 创建线程，避免'不能在任意线程中调用 wait_update'。"""
+        """由【本账户专属线程 _run】调用：执行一次 wait_update + 注册待订阅合约 + 快照缓存。
+        2026-09-09: 调用方从"主线程"改为"本 Slot 专属线程"。wait_update 仍运行在
+        TqApi 创建线程(即本线程), 满足 TqSdk 约束; 且每个账户一个事件循环, 多会话互不饿死。"""
         import time
         if self.client is None or self.client.api is None:
             time.sleep(0.5)
             return
         # 先把请求线程登记的合约注册掉（TqSdk 要求创建线程调用）
         self._register_pending()
+        # 再把 worker 登记的 K 线对象创建请求在主线程执行(同线程约束, 避免并发竞态)
+        self._process_kline_pending()
+        # 技术分析 K 线对象渐进创建(每轮限量, 避免启动洪流压垮会话)
         try:
-            got = self.client.api.wait_update(deadline=time.time() + 0.8)
+            self._process_tech_queue()
+        except Exception:
+            pass
+        try:
+            got = self.client.api.wait_update(deadline=time.time() + 3.0)
             self._poll_cnt = getattr(self, '_poll_cnt', 0) + 1
+            if got:
+                self._last_got = time.time()      # 最后一次真正收到行情包的时刻
+            else:
+                self._last_got = getattr(self, '_last_got', 0)
             if self._poll_cnt % 60 == 1:
-                print(f"[轮询] #{self._poll_cnt} got={got} subscribed={len(self.subscribed)}", flush=True)
+                # 带账号 + "距上次收到包"秒数: 长会话静默(数据冻结)时可直接看出是哪条会话、什么时候断的
+                _silent = int(time.time() - self._last_got) if self._last_got else -1
+                print(f"[轮询] {self.tq_user} #{self._poll_cnt} got={got} subscribed={len(self.subscribed)}"
+                      f" 距上次收包={_silent}s", flush=True)
             # 累积 tick 指标 (现手/外盘/内盘)
             try:
                 self.market.update_tick_metrics()
             except Exception:
                 pass
-            # 保活：默认标的若掉订阅则补回
-            self.ensure_subscribed(DEFAULT_SYMBOLS)
+            # 保活：默认标的 + 本账户自选 若掉订阅则补回
+            watch_syms = self._get_watch_syms()
+            self.ensure_subscribed(list(DEFAULT_SYMBOLS) + list(INDEX_SYMBOLS) + list(WH_INDEX_SYMBOLS) + watch_syms)
             # 对已订阅合约做快照写入缓存
             all_syms = list(self.subscribed)
             try:
@@ -675,6 +1360,9 @@ class AccountSlot:
                     for q in quotes:
                         if "error" not in q and q.get("last_price", 0) > 0:
                             self.latest_data[q["symbol"]] = q
+                            nm = q.get("name")
+                            if nm:
+                                _SYMBOL_NAME_CACHE[q["symbol"]] = nm
                         elif "error" in q:
                             s = q.get("symbol", "")
                             if s and s not in self.subscribed:
@@ -735,16 +1423,23 @@ class AccountSlot:
 
     def _get_kline_obj(self, symbol, duration, count, end_dt=None):
         """安全获取 Kline 对象：连续合约先解析真实合约；失败回退连续合约本身；
-        任何异常都捕获返回 (None, real_symbol) 防止 500。end_dt 用于历史翻页。"""
+        任何异常都捕获返回 (None, real_symbol) 防止 500。end_dt 用于历史翻页。
+
+        注意: 创建 Kline 对象必须走 request_kline_obj(主线程创建), 严禁 worker 线程
+        直接 api.get_kline_serial(并发时竞态致交付全失效)。
+        """
         real = self._resolve_symbol(symbol)
-        # 先试解析出的真实合约
+        # 先试解析出的真实合约(主线程创建对象)
         try:
-            return self.client.get_kline(real, duration, count, end_dt=end_dt), real
+            k = self.request_kline_obj(real, duration, count, end_dt=end_dt)
+            if k is not None:
+                return k, real
         except Exception as e:
             print(f"[K线] 真实合约 {real} 获取失败: {e}")
         # 回退到连续合约本身(天勤支持对 KQ.m@ 直接拉 K 线)
         try:
-            return self.client.get_kline(symbol, duration, count, end_dt=end_dt), symbol
+            k = self.request_kline_obj(symbol, duration, count, end_dt=end_dt)
+            return k, symbol
         except Exception as e:
             print(f"[K线] 连续合约 {symbol} 也获取失败: {e}")
         return None, real
@@ -834,36 +1529,137 @@ class AccountSlot:
 _slots: dict = {}        # key:"user:pass" -> AccountSlot
 _slots_lock = threading.Lock()
 
-# 默认账户(启动时创建, 供无参数访问使用)
-DEFAULT_ACCT_KEY = "zhubajie:jinhu303"
+# 2026-09-08 需求: 去掉所有"默认账户"。账户一律来自网关注入(用户登录后绑定的有效账户)
+# 或显式指定。无凭据一律返回 None, 由各接口对 None 优雅降级(付费功能无数据, 公共功能正常)。
+DEFAULT_ACCT_KEY = None  # 无默认账户
 
 def get_slot(tq_user: str = "", tq_pass: str = ""):
-    """获取或创建账户Slot(激活+轮询)"""
+    """获取或创建账户Slot(激活+轮询)。无凭据返回 None(不再回落任何默认账户)。"""
     if not tq_user or not tq_pass:
-        key = DEFAULT_ACCT_KEY
-    else:
-        key = f"{tq_user}:{tq_pass}"
+        return None
+    key = f"{tq_user}:{tq_pass}"
 
+    need_start = False
     with _slots_lock:
         if key not in _slots:
             user, pwd = key.split(":", 1)
-            # 仅建对象(status="init")；真正连接 / 创建 TqApi 由主线程轮询循环统一驱动，
-            # 避免在任何 Flask 请求线程里创建 TqApi 触发 TqSdk "wait_update 必须在创建线程调用" 的约束报错。
+            # 仅建对象(status="init")；真正的连接/创建 TqApi 由该 Slot 的【专属线程 _run】驱动，
+            # 绝不在 Flask 请求线程里创建 TqApi（TqSdk 要求 wait_update 必须在创建线程调用）。
+            # 2026-09-09 关键修正：多个 TqApi 若共用一个事件循环(主线程串行 wait_update)，
+            # 后建的会话会被饿死、永远 got=False。故每个账户一个独立线程 = 一个独立事件循环。
             slot = AccountSlot(user, pwd)
+            # 解析并缓存本 Slot 对应的本地账户 id(用于自选合约按账户隔离)
+            try:
+                from services import futures_db
+                slot.account_id = futures_db.get_account_id_by_tq_user(user)
+            except Exception:
+                slot.account_id = None
             _slots[key] = slot
+            need_start = True
         slot = _slots[key]
         slot.add_access()
+    # 锁外启动线程(线程内会 connect -> startup_poll, 期间可能回调 get_slot 相关逻辑)
+    if need_start:
+        try:
+            slot.start()
+        except Exception as _e:
+            print(f"[账户:{slot.tq_user}] 槽线程启动失败: {_e}", flush=True)
     return slot
 
 
-def _resolve_slot():
-    """请求感知的账号解析：优先使用【网关注入的当前选中账号】(tq_user/tq_pass 查询参数)，
-    回落到 DEFAULT_ACCT_KEY。用于替换各处写死的 DEFAULT_ACCT_KEY 取 slot 逻辑，
-    使"页面右上角账户选择器"选中的账号真正生效。
+def _account_is_valid(tq_user: str):
+    """校验天勤账户在 tq_accounts 中是否【有效】(启用且未过期)。
 
-    注意：网关(main_v4.py)在代理每个请求时会把 session 里 current_account_id 对应的
-    tq_username/tq_password 以查询参数 tq_user/tq_pass 注入转发，所以此处读 request.args 即可拿到
-    用户选中的账号，而非写死的 zhubajie。
+    expiry 为 NULL(尚未被后台定时刷新探测)视为有效, 不误伤。这是第二道防线:
+    网关在注入前已校验一次(is_account_valid), 此处防"直连 :5088 绕过网关"。
+    查库异常时放行(True), 避免 DB 抖动误伤正常请求。"""
+    if not tq_user:
+        return False
+    try:
+        from services import futures_db
+        conn = futures_db.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM tq_accounts WHERE tq_username=%s AND status=1",
+                (tq_user,))
+            row = cur.fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return True
+
+
+def _expired_slot_reaper():
+    """后台线程: 定时校验已连接 Slot 的账户是否仍有效, 过期/禁用则踢出(关闭连接)。
+
+    配合网关卡 account_expiry_checker(定时刷新 expiry 写表): 网关负责"到期时间的拉取",
+    这里负责"按到期时间踢出已连接的过期 Slot"。过期 Slot 转 expired 状态不再提供数据;
+    账户恢复有效(续费)后自动改回 init, 由主循环重连。"""
+    import time as _t
+    while True:
+        try:
+            with _slots_lock:
+                items = list(_slots.items())
+            for _key, slot in items:
+                valid = _account_is_valid(slot.tq_user)
+                if valid:
+                    if slot.status == "expired":
+                        slot.status = "init"
+                        print(f"[账户] {slot.tq_user} 恢复有效, 重新连接", flush=True)
+                else:
+                    if slot.status == "online":
+                        try:
+                            slot.client.close()
+                        except Exception:
+                            pass
+                        slot.status = "expired"
+                        slot.error_msg = "账户已禁用"
+                        print(f"[账户] {slot.tq_user} 已过期/禁用, 踢出 Slot", flush=True)
+        except Exception as e:
+            print(f"[账户] 踢出任务异常: {e}", flush=True)
+        _t.sleep(60)
+
+
+_ACCT_ROLE_CACHE = {}   # tq_user -> (timestamp, role)
+
+
+def _account_role(tq_user):
+    """读取某天勤账户在 tq_accounts 的 role(monitor/primary/shared)。查不到或异常视为 'shared'。
+    带 60s 内存缓存, 避免技术分析每个请求都打库。
+    """
+    import time as _t
+    now = _t.time()
+    cached = _ACCT_ROLE_CACHE.get(tq_user)
+    if cached and now - cached[0] < 60:
+        return cached[1]
+    role = 'shared'
+    try:
+        from services import futures_db
+        conn = futures_db.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT role FROM tq_accounts WHERE tq_username=%s", (tq_user,))
+            r = cur.fetchone()
+            role = (r[0] if r else 'shared') or 'shared'
+        finally:
+            conn.close()
+    except Exception:
+        role = 'shared'
+    _ACCT_ROLE_CACHE[tq_user] = (now, role)
+    return role
+
+
+def _resolve_slot():
+    """请求感知的账号解析：读取【网关注入的当前选中账号】(tq_user/tq_pass 查询参数)。
+
+    2026-09-08 需求: 不再回落任何默认账户。网关在注入前已校验账户有效(未过期);
+    此处再校验一次作为第二道防线(防直连 :5088 绕过网关)。无有效账户返回 None,
+    各接口据此优雅降级 —— 付费功能(行情/K线/扫描)无数据, 公共功能(日历/到期表)正常。
+
+    2026-09-28 隔离护栏: 技术分析/主连接【绝不使用 monitor 专用账户】(否则会与期货监控
+    抢同一条连接)。若网关注入的是 monitor 账户, 自动重定向到 primary 角色账户。
     """
     tu = tp = ""
     try:
@@ -872,21 +1668,33 @@ def _resolve_slot():
             tp = request.args.get('tq_pass')
     except Exception:
         pass
-    if tu and tp:
+    if not tu or not tp:
+        return None
+    # 隔离护栏: 技术分析的账户不能是 monitor(监控专用)
+    if _account_role(tu) == 'monitor':
         try:
-            # 记住网关注入的凭据: 后台定时任务(全市场遍历)没有 request 上下文,
-            # 只能靠这份记忆按用户名重建 Slot, 否则会回落 zhubajie(无 A 股权限) -> 遍历全空。
-            try:
-                import services.stock_kline as _sk
-                _sk.remember_account(tu, tp)
-            except Exception:
-                pass
-            return get_slot(tu, tp)
+            from services import futures_kline as _fk
+            alt = _fk._pick_role_tq_account('primary') or \
+                  _fk._pick_role_tq_account('shared', exclude_user=tu)
+            if alt:
+                tu, tp = alt
+                print(f"[账户隔离] 网关注入账户为 monitor 专用, 技术分析重定向到 {tu}", flush=True)
         except Exception as _e:
-            print(f"[账户] 选中账号 {tu} 连接失败，回落默认: {_e}")
+            print(f"[账户隔离] 重定向失败: {_e}")
+    if not _account_is_valid(tu):
+        print(f"[账户] {tu} 已过期或已禁用, 拒绝建 Slot", flush=True)
+        return None
     try:
-        return get_slot()
-    except Exception:
+        # 记住网关注入的凭据: 后台定时任务(全市场遍历)没有 request 上下文,
+        # 只能靠这份记忆按用户名重建 Slot。
+        try:
+            import services.stock_kline as _sk
+            _sk.remember_account(tu, tp)
+        except Exception:
+            pass
+        return get_slot(tu, tp)
+    except Exception as _e:
+        print(f"[账户] 选中账号 {tu} 建 Slot 失败: {_e}")
         return None
 
 
@@ -1225,12 +2033,16 @@ function r(){
     lastQuotes=d.data||[];
     var h='';
     d.data.forEach(function(q){
-      var u=q.pct_change>=0?'up':'down',sig=q.pct_change>0?'+':'';
-      var lp=isFinite(q.last_price)?q.last_price.toFixed(2):'--';
+      var noData = q.no_data===true;
+      var u = noData ? '' : (q.pct_change>=0?'up':'down');
+      var sig = noData ? '' : (q.pct_change>0?'+':'');
+      var lp = (q.last_price!=null && isFinite(q.last_price)) ? q.last_price.toFixed(2) : (noData?'无数据':'--');
+      var pctTxt = noData ? '' : (sig + (q.pct_change).toFixed(2) + '%');
+      var fullName = ((q.name||'') + ' ' + q.symbol).trim();
       var active=(q.symbol===curSym)?' active':'';
-      h+='<div class="wl-item'+active+'" data-sym="'+q.symbol+'" onclick="loadKline(\''+q.symbol+'\',\'realtime\')">'+
-        '<div class="wl-row1"><span class="wl-sym">'+q.symbol+'</span><div class="wl-right"><span class="wl-price '+u+'">'+lp+'</span><span class="wl-pct '+u+'">'+sig+(q.pct_change).toFixed(2)+'%</span></div></div>'+
-        '<div class="wl-row2"><span class="wl-name">'+(q.name||'')+'</span><button class="btn btn-primary wl-kline" onclick="event.stopPropagation();loadKline(\''+q.symbol+'\',\'realtime\')">K线</button></div></div>';
+      h+='<div class="wl-item'+active+'" data-sym="'+q.symbol+'" title="'+fullName.replace(/"/g,'')+'" onclick="loadKline(\''+q.symbol+'\',\'realtime\')">'+
+        '<div class="wl-row1"><span class="wl-sym" title="'+q.symbol.replace(/"/g,'')+'">'+q.symbol+'</span><div class="wl-right"><span class="wl-price '+u+'">'+lp+'</span><span class="wl-pct '+u+'">'+pctTxt+'</span></div></div>'+
+        '<div class="wl-row2"><span class="wl-name" title="'+fullName.replace(/"/g,'')+'">'+(q.name||'')+'</span><button class="btn btn-primary wl-kline" onclick="event.stopPropagation();loadKline(\''+q.symbol+'\',\'realtime\')">K线</button></div></div>';
     });
     document.getElementById('wl-body').innerHTML=h||'<div class="wl-empty">无数据</div>';
     document.getElementById('status').textContent='更新: '+new Date().toLocaleTimeString()+' | TqSdk';
@@ -1510,14 +2322,35 @@ def api_quotes():
     tq_user = request.args.get("tq_user", "")
     tq_pass = request.args.get("tq_pass", "")
     slot = get_slot(tq_user, tq_pass)
-
+    if slot is None:
+        return safe_json({"code": -1, "msg": "无有效账户"}, 503)
     if slot.status == "error":
         return safe_json({"code": -1, "msg": f"账户登录失败: {slot.error_msg}"}, 503)
     if slot.status in ("connecting", "init"):
         return safe_json({"code": -1, "msg": "账户连接中,请稍后刷新"}, 503)
 
-    result = slot.get_quotes()
-    result.sort(key=lambda x: x.get("symbol", ""))
+    # 本账户自选合约(按账户隔离); 无自选时种子默认合约。保证"加了自选就显示", 无行情的也占位。
+    try:
+        from services import futures_db
+        watch_syms = futures_db.get_watchlist_symbols(slot.account_id, seed=DEFAULT_SYMBOLS) if slot.account_id \
+            else list(DEFAULT_SYMBOLS)
+    except Exception:
+        watch_syms = list(DEFAULT_SYMBOLS)
+    live = {q["symbol"]: q for q in slot.get_quotes()}
+    # 同步名称缓存(供无行情标的显示中文名 + tooltip)
+    for q in live.values():
+        nm = q.get("name")
+        if nm:
+            _SYMBOL_NAME_CACHE[q["symbol"]] = nm
+    result = []
+    for sym in watch_syms:
+        q = live.get(sym)
+        if q is None:
+            # 占位: 该账户对合约无行情权限/未订阅 -> 仍展示合约, 标 no_data
+            q = {"symbol": sym, "name": _SYMBOL_NAME_CACHE.get(sym, ""),
+                 "last_price": None, "pct_change": 0.0, "no_data": True}
+        result.append(q)
+
     clean_result = []
     for q in result:
         clean = {}
@@ -3265,12 +4098,11 @@ def _build_expiry_html(year, month, view, base_path, underlying=None, back_js=No
                 parts = []
                 if view in ('all', 'futures') and day.get("futures"):
                     f = day["futures"]
-                    ex = f'<span class="ex-badge">{f["exchange"]}</span>' if f.get("exchange") else ''
                     prods_html = ""
                     for sym, nm in f.get("products", []):
                         safe = sym.replace("'", "\\'")
                         prods_html += f'<span class="fut-link" onclick="gotoOptions(\'{safe}\')" title="查看对应期权合约">{nm}</span>'
-                    parts.append(f'{ex}<span class="tag-f">期货</span>{prods_html}')
+                    parts.append(prods_html)
                 if view in ('all', 'options') and day.get("options"):
                     o = day["options"]
                     und_lines = [f'<span class="opt-und" onclick="filterOptionsByUnderlying(\'{html.escape(u).replace(chr(39), chr(92)+chr(39))}\')" title="只看 {html.escape(u)} 的期权">{html.escape(futures_db.option_underlying_name(u))}</span>'
@@ -3485,7 +4317,7 @@ h2{{color:var(--accent);font-size:16px;margin:8px 0 6px;padding-bottom:4px;borde
 .tag-f,.tag-o{{display:inline-block;font-size:7px;padding:1px 2px;border-radius:2px;margin:1px 0;font-weight:800;vertical-align:middle}}
 .tag-f{{background:linear-gradient(135deg,var(--accent),#2563eb);color:#08111f}}
 .tag-o{{background:linear-gradient(135deg,var(--gold),#d97706);color:#1a1206}}
-.fut-link{{color:#5ee7ff;cursor:pointer;text-decoration:none;font-size:8px}}
+.fut-link{{color:#5ee7ff;cursor:pointer;text-decoration:none;font-size:11px}}
 .fut-link:hover{{color:var(--gold);text-decoration:underline}}
 .opt-und{{cursor:pointer;color:#5ee7ff;text-decoration:none;font-size:11px}}
 .opt-und:hover{{color:var(--gold);text-decoration:underline}}
@@ -3628,6 +4460,7 @@ _OPT_EXCHANGE_ITEMS = [
     ("中金所期权", "CFFEX"), ("上交所期权", "SSE"), ("深交所期权", "SZSE"),
     ("期权主力合约", "__main__"), ("平值期权", "__atm__"),
     ("条件筛选", "__filter__"), ("期权VIX指数", "__vix__"), ("标的排名", "__rank__"),
+    # 注: 期权费率是独立大模块(/optrate), 已在 modules 表注册, 不作为期权子页入口。
 ]
 
 
@@ -4188,15 +5021,23 @@ from services import short_term_quant
 short_term_quant.register_routes(app, _slots, DEFAULT_ACCT_KEY, _resolve_slot)
 
 from services import futures_kline
-futures_kline.register_routes(app, _slots, DEFAULT_ACCT_KEY, _resolve_slot)
+futures_kline.register_routes(app, _slots, DEFAULT_ACCT_KEY, _resolve_slot, create_slot=get_slot)
 
 # 注册股票模块（全部 A 股 + 周/月 MACD 金叉）
 from services import stock_kline
 stock_kline.register_routes(app, _slots, DEFAULT_ACCT_KEY, _resolve_slot, make_slot=get_slot)
 
+# 注册多周期技术分析矩阵模块
+from services import stock_tech
+stock_tech.register_routes(app, _slots, DEFAULT_ACCT_KEY, _resolve_slot, make_slot=get_slot)
+
 # 注册期货全市场实时监控预警模块
 from services import future_monitor
 future_monitor.register_routes(app, _slots, DEFAULT_ACCT_KEY, _resolve_slot)
+
+# 注册期权费率模块（2026-10-12 独立大模块：费率=平值期权价/标的价×365/到期天数，低/高两分区排序）
+from services import option_rate
+option_rate.register_routes(app, _slots, DEFAULT_ACCT_KEY, _resolve_slot)
 
 
 def _load_expiry_cache(cache_key, year, month):
@@ -4213,19 +5054,39 @@ def _load_expiry_cache(cache_key, year, month):
         print(f"[到期日历] {cache_key} 查询失败: {e}")
 
 
+def _resolve_acct_id():
+    """从网关注入的 tq_user 解析本地账户 id(自选合约按账户隔离)。"""
+    tq_user = request.args.get("tq_user", "")
+    if not tq_user:
+        return None
+    try:
+        from services import futures_db
+        return futures_db.get_account_id_by_tq_user(tq_user)
+    except Exception:
+        return None
+
+
 @app.route("/api/symbols/add")
 def api_add():
     sym = request.args.get("symbol", "").strip()
     if not sym: return jsonify({"code": -1}), 400
-    if sym not in DEFAULT_SYMBOLS:
-        DEFAULT_SYMBOLS.append(sym)
+    acct_id = _resolve_acct_id()
+    if not acct_id:
+        return jsonify({"code": -1, "msg": "无有效账户"}), 400
+    from services import futures_db
+    futures_db.add_watchlist_symbol(acct_id, sym)
     return jsonify({"code": 0})
+
 
 @app.route("/api/symbols/remove")
 def api_rem():
     sym = request.args.get("symbol", "").strip()
     if not sym: return jsonify({"code": -1}), 400
-    if sym in DEFAULT_SYMBOLS: DEFAULT_SYMBOLS.remove(sym)
+    acct_id = _resolve_acct_id()
+    if not acct_id:
+        return jsonify({"code": -1, "msg": "无有效账户"}), 400
+    from services import futures_db
+    futures_db.remove_watchlist_symbol(acct_id, sym)
     return jsonify({"code": 0})
 
 
@@ -4400,6 +5261,16 @@ def api_chain_smile():
 
 
 def main():
+    global futures_db
+    # 提前在全局层面确保 futures_db 可用: 下方 main() 内 5267/5298 两处 `from services import
+    # futures_db` 均无 global 声明, 被 Python 当作闭包 cell; 当网关(:9000)未就绪(注册回调不触发)
+    # 且 6s 内未取到配置时, 该 cell 未被填充, 5290 行引用即抛 UnboundLocalError 导致整个进程启动崩溃。
+    # 安装版因同起网关而侥幸不触发; dev 单起 stock_app 必崩。此处全局预初始化, 既让 dev 可独立启动,
+    # 也对安装版完全无害(5298 的 from import 同样落全局, 覆盖即可)。
+    try:
+        from services import futures_db
+    except Exception:
+        futures_db = None
     print("=" * 50)
     print("  stock_app 多账户版 | http://127.0.0.1:5088")
     print("=" * 50)
@@ -4412,18 +5283,42 @@ def main():
     _probe.settimeout(0.5)
     try:
         if _probe.connect_ex(('127.0.0.1', 5088)) == 0:
-            print("[启动] ✗ 检测到 :5088 已被占用（疑似已有 stock_app 在跑）。本进程退出，避免重复注册导致 token 漂移。\n"
+            print("[启动] [X] 检测到 :5088 已被占用（疑似已有 stock_app 在跑）。本进程退出，避免重复注册导致 token 漂移。\n"
                   "       如确需重启，请先停止旧进程后再启动。")
             sys.exit(1)
     finally:
         _probe.close()
-    # ===== 注册到 stock_main 并挂载 /health + 网关令牌校验 =====
+    # ===== 注册到 stock_main（挂 /health + 网关令牌校验）并取回网关下发的数据库配置 =====
     # 注意：register_service 必须在 `python main.py` 直接运行时才执行（下面 __main__ 守护），
     # 严禁在模块级别调用，否则任何 `import main`（包括测试/调试子进程）都会触发
     # POST /register → 轮换 DB 中 stock-app-01 的 service_token / gw_secret，导致与
     # 长跑进程的 client.token / gw_secret 失同步 → 心跳 403 → OFFLINE。
     try:
         from center_client import ServiceConfig, register_service
+    except ImportError:
+        ServiceConfig = register_service = None
+        print("[注册] center_client 未安装, 跳过注册")
+    if register_service:
+        # 旧版 center_client 没有库配置下发能力, 此处优雅降级为"用本地配置"
+        try:
+            from center_client import on_db_config, wait_db_config
+        except ImportError:
+            on_db_config = wait_db_config = None
+            print("[DB] center_client 版本较旧(无库配置下发能力), 使用本地配置")
+
+        def _apply_gw_db(_cfg):
+            try:
+                # 函数内自包含导入: 避免依赖 main() 的局部 `from services import futures_db`
+                # (main() 后续还有同名函数级导入, 会把它变成闭包 cell, 回调先于那些导入执行时
+                # 触发 "free variable 'futures_db' referenced before assignment" 的 UnboundLocalError)
+                from services import futures_db
+                futures_db.apply_db_config(_cfg, source='gateway')
+            except Exception as _e:
+                print("[DB] 采用网关下发的数据库配置失败: %s" % _e)
+
+        if on_db_config:
+            # 回调先挂上: 注册成功立即触发; 中心未就绪则等后台重试注册成功后再触发
+            on_db_config(_apply_gw_db)
         register_service(app, ServiceConfig(
             center_url="http://127.0.0.1:9000",
             service_name="stock-app-01",
@@ -4436,11 +5331,14 @@ def main():
                     "/optchain/api/kline", "/optchain/api/kline/history", "/optchain/api/options/main_extras",
                     "/optchain/main", "/optchain/atm", "/optchain/filter", "/optchain/vix", "/optchain/rank"]
         ))
-    except ImportError:
-        print("[注册] center_client 未安装, 跳过注册")
-    # 启动默认账户
-    print("[启动] 连接默认账户 zhubajie...")
-    _slot = get_slot("zhubajie", "jinhu303")
+        # 中心未就绪时注册会走后台重试; 等一下再放行, 避免首个 DB 调用先连到错库
+        if wait_db_config and not wait_db_config(6.0):
+            print("[DB] 未取到网关下发的数据库配置, 使用本地配置 %s:%s/%s"
+                  % (futures_db.DB_CONFIG.get('host'), futures_db.DB_CONFIG.get('port'),
+                     futures_db.DB_CONFIG.get('database')))
+    # 2026-09-08 需求: 不再启动时硬连默认账户。Slot 改为懒加载 —— 用户登录后经网关
+    # 注入有效账户凭据, 首次请求时 get_slot 建 Slot, 主线程循环再 connect。
+    print("[启动] 账户改为懒加载(无默认账户), 由网关注入有效账户后按需连接")
     # 定时同步: 每日凌晨2:00 增量拉取(只拉库里没有的新合约), 不在启动时全量刷天勤.
     # 仅当两张表都还空着(首次部署)时才在启动后补一次全量初始化.
     try:
@@ -4455,44 +5353,57 @@ def main():
     # 之前把 wait_update 放到独立后台线程，TqSdk 会报"不能在任意线程中调用 wait_update"。
     # 因此 Flask 移入后台线程，主线程同时负责：① 驱动 wait_update 轮询 ② 注册请求线程登记的订阅。
     import threading as _th
-    _flask = _th.Thread(target=lambda: app.run(host="0.0.0.0", port=5088,
+    # 2026-09-21: 只绑 127.0.0.1 —— 局域网无法直连 5088（端口不可见），
+    # 全部流量必须经网关 :9000 注入账户+令牌；网关与本服务同机，代理不受影响。
+    _flask = _th.Thread(target=lambda: app.run(host="127.0.0.1", port=5088,
                                                debug=False, use_reloader=False), daemon=True)
     _flask.start()
     print("[OK] Flask 已在后台线程监听 :5088；主线程运行 TqSdk 轮询/订阅循环...")
-    # 关键修正：原先只轮询默认账户 _slot(zhubajie)，用户切换选中的账户(Mr qia 等)虽建了 Slot
-    # 却从未被 poll_step 驱动，导致 self.latest_data 永远为空 -> 行情看板"无数据" / 加自选无效。
-    # 现改为在主线程统一驱动【所有】已注册 Slot；所有 Slot 的 TqApi 都在主线程创建(满足 TqSdk 同线程约束)。
+    # 启动后台预热技术分析指标缓存(默认6 + 候选11 共17指数去重): 把冷算 18s 从"用户点击时"
+    # 前移到"启动期", 使任意用户首次/切回技术分析页直接命中热缓存秒开。函数内部自等账号在线+K线就绪。
+    try:
+        from services.stock_tech import _preload_tech_cache
+        # 构建优先队列(LEFT 固定标首 → 默认标 → 候选标)并自起 worker 串行预热; 用户打开页面时
+        # 客户端会把其缓存的标通过 /stocktech/api/preload_priority 插到队首 => 打开即见。
+        _preload_tech_cache()
+        print("[技术分析] 指标缓存后台预加载已启动(优先队列)")
+    except Exception as _e:
+        print(f"[技术分析] 预加载线程启动失败: {_e}")
+    # 定时踢出过期账户的 Slot(与网关卡 account_expiry_checker 配合, 校验+更新过期状态)
+    threading.Thread(target=_expired_slot_reaper, daemon=True).start()
+    print("[账户] 过期踢出任务已启动 (每60s检查)")
+    # 定时下载用的有效账户缓存列表: 启动时加载所有有效账户; 后台线程定期刷新(剔除过期、加入新账户、唤醒暂停下载)
+    try:
+        from services import futures_db
+        futures_db.init_sync_account_cache()
+        threading.Thread(target=futures_db.refresh_sync_account_cache, daemon=True).start()
+        print("[同步缓存] 有效账户缓存列表已启动")
+        futures_db.init_watchlist_table()
+        print("[自选] 自选合约表已就绪(按账户隔离 t_watchlist)")
+        futures_db.init_kline_deny_table()
+        print("[K线黑名单] 毒化标的黑名单表已就绪(t_kline_deny)")
+    except Exception as _e:
+        print(f"[同步缓存] 初始化失败: {_e}")
+    # ===== 2026-09-09 架构修正(多账户抢事件循环的真 bug) =====
+    # 旧实现: 所有 Slot 的 TqApi 都在【主线程】创建并由主线程串行 wait_update 驱动。
+    # 后果: 多账户共存时后建会话被饿死 —— 实测 Mr qia 的 TqApi 永远 got=False/距上次收包=-1s,
+    #       而同一进程里 zhubajie 正常收包; 独立进程单独跑 Mr qia 又能正常收行情(已验证)。
+    # 新实现: 每个 AccountSlot 独占一个线程, TqApi 在该线程内创建 + wait_update(各自独立事件循环),
+    #       天然满足 TqSdk "wait_update 必须在创建线程调用" 的约束, 且多账户互不干扰。
+    # 主线程此处仅做"心跳看门狗": 兜底唤醒未启动的 Slot, 自身不碰任何 TqApi。
     import time as _t
     while True:
         try:
-            # 仅取快照后释放锁，避免持锁调用可能回灌 get_slot 的 poll 方法造成死锁
             with _slots_lock:
                 _all = list(_slots.values())
             for slot in _all:
-                if slot.status == "init":
-                    # 在主线程创建 TqApi 并预加载(满足 TqSdk 同线程约束)
-                    slot.connect()
-                    if slot.status == "online":
-                        try:
-                            slot.startup_poll()
-                        except Exception as _e:
-                            print(f"[账户:{slot.tq_user}] 预加载异常: {_e}")
-                elif slot.status == "online":
-                    slot.poll_step()
-                elif slot.status == "error":
-                    # 轻量重连：每 300s 重试一次，应对临时网络/限流/天勤 trial 短暂不可用
-                    _now = _t.time()
-                    if _now - getattr(slot, "_last_err_try", 0) > 300:
-                        slot._last_err_try = _now
-                        print(f"[账户:{slot.tq_user}] 尝试重连...")
-                        slot.connect()
-                        if slot.status == "online":
-                            try:
-                                slot.startup_poll()
-                            except Exception:
-                                pass
+                # 兜底: 任何原因导致专属线程没起来(status 停在 init), 这里补启动一次
+                if not getattr(slot, "_thread_started", False):
+                    print(f"[主循环] 补启动槽线程: {slot.tq_user}", flush=True)
+                    slot.start()
         except Exception as _e:
-            print(f"[主循环] 异常(已忽略): {_e}")
+            print(f"[主循环] 异常(已忽略): {_e}", flush=True)
+        _t.sleep(5)
 
 
 WORKBENCH_HTML = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>行情终端 · WH 风格工作台</title>
@@ -4711,6 +5622,25 @@ restoreSidebar();
 @app.route("/workbench")
 def workbench():
     return WORKBENCH_HTML
+
+
+@app.after_request
+def _add_page_cache_headers(resp):
+    # 页面/静态资源浏览器缓存: 仅对 html 整页与静态资源(JS/CSS/图片/字体)加缓存头,
+    # 实时数据 API(JSON)一律不动 -> 不影响既有逻辑与实时行情。
+    # 若响应已自带 Cache-Control(如过期页 no-cache)则保留, 不覆盖。
+    if "Cache-Control" in resp.headers:
+        return resp
+    if resp.status_code >= 400:  # 错误响应(403/302 等)不加缓存头, 避免缓存错误页
+        return resp
+    ct = (resp.content_type or "").lower()
+    path = request.path or ""
+    if "text/html" in ct:
+        resp.headers["Cache-Control"] = "public, max-age=300"
+    elif path.startswith("/static/") or any(t in ct for t in ("javascript", "css", "image/", "font/")):
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
 
 if __name__ == "__main__":
     main()

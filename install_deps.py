@@ -8,7 +8,7 @@ for pkg in packages:
     print(f"正在安装 {pkg}...")
     try:
         __import__(pkg)
-        print(f"  ✓ {pkg} 已安装")
+        print(f"  [OK] {pkg} 已安装")
     except ImportError:
         cmd = [
             sys.executable, "-m", "pip", "install", "--isolated",
@@ -22,10 +22,10 @@ for pkg in packages:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            print(f"  ✓ {pkg} 安装成功")
+            print(f"  [OK] {pkg} 安装成功")
         else:
             # 只输出最后几行错误
             err_lines = result.stderr.strip().split("\n")[-5:]
-            print(f"  ✗ {pkg} 安装失败:\n    " + "\n    ".join(err_lines))
+            print(f"  [X] {pkg} 安装失败:\n    " + "\n    ".join(err_lines))
 
 print("\n所有依赖安装完成!")

@@ -8,15 +8,55 @@ import pymysql
 import datetime
 import os
 import queue
+import threading
+import time
+import configparser
 
-DB_CONFIG = {
+# 库配置来源优先级: 1) 环境变量 APP_CONFIG 指向的 config.ini(安装版 launcher 会设);
+#                      2) 脚本同目录 config.ini;  3) 内置默认值(dev 环境走这条)。
+# ⚠ 这只是【兜底】: 运行期若收到网关(stock_main)随注册下发的库配置, 会被 apply_db_config()
+#   就地覆盖 —— 网关才是配置的唯一来源, 库里改地址只改网关一份即可。
+_CONFIG_FILE = None
+
+
+def _load_db_config(defaults):
+    global _CONFIG_FILE
+    cfg_path = os.environ.get("APP_CONFIG")
+    if not (cfg_path and os.path.isfile(cfg_path)):
+        here = os.path.dirname(os.path.abspath(__file__))
+        cand = os.path.join(here, "config.ini")
+        if os.path.isfile(cand):
+            cfg_path = cand
+    if cfg_path and os.path.isfile(cfg_path):
+        try:
+            cp = configparser.ConfigParser()
+            cp.read(cfg_path, encoding="utf-8")
+            if cp.has_section("database"):
+                d = dict(defaults)
+                for k in ("host", "port", "user", "password", "database", "charset"):
+                    if cp.has_option("database", k):
+                        v = cp.get("database", k).strip()
+                        if k == "port":
+                            try:
+                                v = int(v)
+                            except Exception:
+                                pass
+                        d[k] = v
+                _CONFIG_FILE = cfg_path
+                return d
+        except Exception:
+            pass
+    return dict(defaults)
+
+
+DB_CONFIG = _load_db_config({
     "host": "192.168.0.106",
     "port": 3304,
     "user": "zhq",
     "password": "zhq1",
     "database": "d_lnx_tqhq",
     "charset": "utf8mb4"
-}
+})
 
 # ===== 连接池：避免每次查询都新建 TCP 连接(远程 MySQL 握手约 60ms/次) =====
 # 实测未池化时，单次 chain_panel 请求约 4 次 get_connection()，浪费 ~240ms。
@@ -57,6 +97,70 @@ def _return_connection(conn):
         pass
 
 
+def _drain_pool():
+    """清空连接池: 切换数据库时必须调用, 否则池里还挂着指向旧库的连接。"""
+    closed = 0
+    while True:
+        try:
+            conn = _POOL.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            conn.close()
+            closed += 1
+        except Exception:
+            pass
+    return closed
+
+
+DB_SOURCE = 'local'          # 当前库配置来源(local / gateway / refresh), 便于排障
+DB_SWITCH_COUNT = 0          # 运行期切库次数
+
+
+def apply_db_config(cfg, source='gateway'):
+    """采用网关下发的数据库配置(就地合并进 DB_CONFIG)。
+
+    就地 update 而不是整体替换对象, 是为了让所有 `futures_db.DB_CONFIG` 的既有引用
+    (stock_tech / stock_kline 里直接取 cfg 建连的地方) 自动生效, 无需逐个改调用点。
+    配置确有变化时清空连接池 —— 否则池中旧连接仍会把查询打到旧库上。
+    返回 True 表示库配置发生了实际变化。
+    """
+    global DB_SOURCE, DB_SWITCH_COUNT
+    if not cfg:
+        return False
+    patch = {}
+    for k in ('host', 'port', 'user', 'password', 'database', 'charset'):
+        v = cfg.get(k)
+        if v is None or v == '':
+            continue
+        if k == 'port':
+            try:
+                v = int(v)
+            except Exception:
+                continue
+        patch[k] = v
+    if not patch:
+        return False
+    changed = any(str(DB_CONFIG.get(k)) != str(v) for k, v in patch.items())
+    if not changed:
+        DB_SOURCE = source
+        return False
+    DB_CONFIG.update(patch)
+    DB_SOURCE = source
+    DB_SWITCH_COUNT += 1
+    closed = _drain_pool()
+    print('[DB配置] 已切换数据库 -> %s:%s/%s (来源=%s, 关闭旧连接 %d 个)'
+          % (DB_CONFIG.get('host'), DB_CONFIG.get('port'), DB_CONFIG.get('database'),
+             source, closed), flush=True)
+    return True
+
+
+def db_config_desc():
+    """给日志/自检用的一行描述(不含口令)。"""
+    return '%s:%s/%s (来源=%s)' % (DB_CONFIG.get('host'), DB_CONFIG.get('port'),
+                                   DB_CONFIG.get('database'), DB_SOURCE)
+
+
 def get_connection(cfg=None):
     """从连接池取一个可用连接(自动探活)，池空则新建。调用方照常 conn.close() 即可归还。"""
     cfg = cfg or DB_CONFIG
@@ -71,6 +175,110 @@ def get_connection(cfg=None):
     except queue.Empty:
         pass
     return _PooledConnection(pymysql.connect(**cfg))
+
+
+# ========== 定时下载用的【有效账户缓存列表】(2026-09-08 需求) ==========
+# 项目启动时加载所有有效账户; 后台线程定期刷新(剔除过期/停用, 加入新有效账户);
+# 下载任务无有效账户时暂停并等待 _SYNC_WAKE 唤醒(用户关联新有效账户后由刷新线程置位)。
+_SYNC_ACCOUNT_CACHE = []            # list of dict {id,user,pass,expiry}
+_SYNC_CACHE_LOCK = threading.Lock()
+_SYNC_WAKE = threading.Event()
+_SYNC_CACHE_REFRESH_SEC = 60
+
+def _decrypt_tq_pass(cipher):
+    """天勤密码 Fernet 解密; 失败按明文兜底(迁移前旧数据)。"""
+    import hashlib, base64
+    try:
+        from cryptography.fernet import Fernet
+        raw = os.environ.get('TQ_PASS_KEY') or 'stock-dev-default-passkey-change-me'
+        key = base64.urlsafe_b64encode(hashlib.sha256(raw.encode()).digest())
+        return Fernet(key).decrypt(cipher.encode()).decode()
+    except Exception:
+        return cipher
+
+
+def _load_valid_sync_accounts():
+    """从 DB 载入所有【有效】账户(启用且未过期), 返回 list of dict。"""
+    out = []
+    try:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, tq_username, tq_password FROM tq_accounts "
+                "WHERE status=1 AND (expiry IS NULL OR expiry > NOW())")
+            for aid, user, cipher in cur.fetchall():
+                out.append({'id': aid, 'user': user, 'pass': _decrypt_tq_pass(cipher)})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[同步缓存] 载入有效账户失败: {e}", flush=True)
+    return out
+
+
+def init_sync_account_cache():
+    """项目启动时调用: 加载所有有效账户到缓存列表。"""
+    global _SYNC_ACCOUNT_CACHE
+    with _SYNC_CACHE_LOCK:
+        _SYNC_ACCOUNT_CACHE = _load_valid_sync_accounts()
+    n = len(_SYNC_ACCOUNT_CACHE)
+    print(f"[同步缓存] 初始化有效账户 {n} 个" + ("" if n else " (暂无可用的有效账户, 下载将暂停直至关联有效账户)"), flush=True)
+
+
+def refresh_sync_account_cache():
+    """后台线程: 定期刷新有效账户缓存。剔除过期/停用, 加入新有效账户。
+    当缓存由空变非空(用户关联了新有效账户)时置位 _SYNC_WAKE 唤醒暂停的下载。"""
+    global _SYNC_ACCOUNT_CACHE
+    while True:
+        try:
+            new_list = _load_valid_sync_accounts()
+            with _SYNC_CACHE_LOCK:
+                was_empty = len(_SYNC_ACCOUNT_CACHE) == 0
+                added = [a['user'] for a in new_list
+                         if a['id'] not in {x['id'] for x in _SYNC_ACCOUNT_CACHE}]
+                _SYNC_ACCOUNT_CACHE = new_list
+                now_nonempty = len(new_list) > 0
+            if (was_empty and now_nonempty) or added:
+                _SYNC_WAKE.set()
+                msg = "发现新的有效账户, 已唤醒暂停的下载" if (was_empty and now_nonempty) else f"新增有效账户: {', '.join(added)}"
+                print(f"[同步缓存] {msg}", flush=True)
+        except Exception as e:
+            print(f"[同步缓存] 刷新异常: {e}", flush=True)
+        time.sleep(_SYNC_CACHE_REFRESH_SEC)
+
+
+def get_sync_account():
+    """从缓存取一个有效账户 (user, pass); 缓存为空返回 (None, None)。
+    多账户时每次轮换(用到末尾), 实现负载均衡。"""
+    with _SYNC_CACHE_LOCK:
+        if not _SYNC_ACCOUNT_CACHE:
+            return None, None
+        acct = _SYNC_ACCOUNT_CACHE[0]
+        _SYNC_ACCOUNT_CACHE.append(_SYNC_ACCOUNT_CACHE.pop(0))  # 轮换
+        return acct['user'], acct['pass']
+
+
+def get_sync_account_or_wait(max_wait=None):
+    """取得有效账户; 若无则暂停下载、等待唤醒(用户关联新有效账户会唤醒), 直到有账户或超时。
+    max_wait=None 表示无限等待(用于定时下载: 直到用户关联有效账户才继续); 否则超时返回 (None,None)。"""
+    if max_wait:
+        deadline = time.time() + max_wait
+    while True:
+        u, p = get_sync_account()
+        if u:
+            return u, p
+        with _SYNC_CACHE_LOCK:
+            nonempty = bool(_SYNC_ACCOUNT_CACHE)
+        if nonempty:
+            continue
+        _SYNC_WAKE.clear()
+        remaining = None
+        if max_wait:
+            remaining = max(1, deadline - time.time())
+            if remaining <= 0:
+                return None, None
+        print("[同步] 当前无有效账户, 暂停下载, 等待用户关联有效账户...", flush=True)
+        _SYNC_WAKE.wait(remaining if remaining is not None else 3600)
 
 
 def batch_upsert_expiry(records):
@@ -453,6 +661,13 @@ PROD_NAME.update({
     "DCE.jm": "焦煤", "DCE.j": "焦炭",
     "INE.bc": "国际铜",
     "CZCE.PL": "瓶片",
+    # 中金所(2026-10-14 补: 子合约监控纳入了 CFFEX 品种, 原表只有 IF 在
+    # t_product_info 里能查到, 国债期货 T/TF/TS/TL 查不到 -> 页面显示原始代码)。
+    # 显示口径对齐文华 WH6/东方财富习惯写法。
+    "CFFEX.IF": "沪深300股指", "CFFEX.IC": "中证500股指",
+    "CFFEX.IH": "上证50股指", "CFFEX.IM": "中证1000股指",
+    "CFFEX.T": "10年期国债", "CFFEX.TF": "5年期国债",
+    "CFFEX.TS": "2年期国债", "CFFEX.TL": "30年期国债",
 })
 
 # 品种中文名 DB 映射缓存(来自 t_product_info, 覆盖全市场期货/期权品种, 含 PROD_NAME 未列者)
@@ -826,7 +1041,11 @@ def sync_from_tqsdk(months_ahead=12, months_back=12, progress_cb=None, increment
 
     EX = {"SHFE":"上期所","DCE":"大商所","CZCE":"郑商所","CFFEX":"中金所","INE":"上期能源","GFEX":"广期所"}
     print("[同步-期货] 连接天勤...")
-    api = TqApi(auth=TqAuth("zhubajie","jinhu303"))
+    _su, _sp = get_sync_account_or_wait()
+    if not _su:
+        print("[同步-期货] 等待超时仍无有效账户, 本次同步跳过(下次定时将重试)")
+        return 0
+    api = TqApi(auth=TqAuth(_su, _sp))
     all_syms = api.query_quotes(ins_class="FUTURE", expired=False)
     if incremental:
         # 增量: 仅保留库里还没有的合约, 跳过已入库的(到期日静态不会变)
@@ -920,7 +1139,11 @@ def sync_options_from_tqsdk(months_ahead=12, months_back=12, progress_cb=None, i
 
     EX = {"SHFE":"上期所","DCE":"大商所","CZCE":"郑商所","CFFEX":"中金所","INE":"上期能源","GFEX":"广期所","SSE":"上交所","SZSE":"深交所"}
     print("[同步-期权] 连接天勤...")
-    api = TqApi(auth=TqAuth("zhubajie","jinhu303"))
+    _su, _sp = get_sync_account_or_wait()
+    if not _su:
+        print("[同步-期权] 等待超时仍无有效账户, 本次同步跳过(下次定时将重试)")
+        return 0
+    api = TqApi(auth=TqAuth(_su, _sp))
 
     # 收集候选 symbol: 未到期 + 已到期(回溯)。
     # 合约月份无法从代码可靠解析(尤其上交所/深交所 ETF 期权代码是8位期权号),
@@ -1045,3 +1268,156 @@ def sync_options_from_tqsdk(months_ahead=12, months_back=12, progress_cb=None, i
     finally:
         conn.close(); api.close()
     return total
+
+# ===== 自选合约(按天勤账户隔离) =====
+# 历史实现把自选存在 stock_app 进程内全局变量 DEFAULT_SYMBOLS, 导致【所有账户共享同一份自选】
+# (Mr qia 能看到 zhubajie 加的合约)。改为按账户落库, 每个天勤账户拥有独立自选列表。
+def init_watchlist_table():
+    """创建自选合约表(按账户隔离)。"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS t_watchlist (
+                id          INT AUTO_INCREMENT PRIMARY KEY,
+                account_id  INT          NOT NULL,
+                symbol      VARCHAR(64)  NOT NULL,
+                sort_order  INT          DEFAULT 0,
+                created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uk_acct_sym (account_id, symbol),
+                KEY idx_acct (account_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_account_id_by_tq_user(tq_user):
+    """天勤用户名 -> 本地账户 id (tq_accounts)。"""
+    if not tq_user:
+        return None
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM tq_accounts WHERE tq_username=%s", (tq_user,))
+        r = cur.fetchone()
+        return r[0] if r else None
+    finally:
+        conn.close()
+
+
+def get_watchlist_symbols(account_id, seed=None):
+    """返回该账户的自选合约列表(按 sort_order 排序)。
+    若账户尚无自选且给定 seed(默认合约), 则用 seed 初始化(保证老行为: 默认 4 个主连可见)。"""
+    if not account_id:
+        return []
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT symbol FROM t_watchlist WHERE account_id=%s ORDER BY sort_order, id",
+            (account_id,))
+        rows = [r[0] for r in cur.fetchall()]
+        if not rows and seed:
+            for i, s in enumerate(seed):
+                try:
+                    cur.execute(
+                        "INSERT IGNORE INTO t_watchlist (account_id, symbol, sort_order) VALUES (%s, %s, %s)",
+                        (account_id, s, i))
+                except Exception:
+                    pass
+            conn.commit()
+            rows = list(seed)
+        return rows
+    finally:
+        conn.close()
+
+
+def add_watchlist_symbol(account_id, symbol):
+    if not account_id or not symbol:
+        return False
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM t_watchlist WHERE account_id=%s",
+            (account_id,))
+        nxt = cur.fetchone()[0]
+        cur.execute(
+            "INSERT IGNORE INTO t_watchlist (account_id, symbol, sort_order) VALUES (%s, %s, %s)",
+            (account_id, symbol, nxt))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def remove_watchlist_symbol(account_id, symbol):
+    if not account_id or not symbol:
+        return False
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM t_watchlist WHERE account_id=%s AND symbol=%s",
+            (account_id, symbol))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ===== K线"无权限/毒化"标的黑名单(按天勤账户持久化) =====
+# 实锤根因(2026-09-09): 用无权限标的调 get_kline_serial 会【毒化整条天勤会话】——
+# 此后该会话不再推送任何行情包(轮询 got=False/距上次收包=-1s), 连本来正常的期货K线也全空。
+# 对照组: 同账户独立进程仅订阅期货 -> 289/289 全部收包; 请求 SSE.000688(graphql报错)/
+# SZSE.399006(超时) 之后 -> 0/14 收包, 会话静默。
+# 因此"账户-无权限标的"必须落库持久记忆, 主会话永不触碰。
+def init_kline_deny_table():
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS t_kline_deny (
+                id          INT AUTO_INCREMENT PRIMARY KEY,
+                account_id  INT          NOT NULL,
+                symbol      VARCHAR(64)  NOT NULL,
+                reason      VARCHAR(255) DEFAULT '',
+                created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uk_acct_sym (account_id, symbol),
+                KEY idx_acct (account_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_kline_deny(account_id):
+    """返回该账户已知会毒化会话的标的集合。"""
+    if not account_id:
+        return set()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT symbol FROM t_kline_deny WHERE account_id=%s", (account_id,))
+        return {r[0] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def add_kline_deny(account_id, symbol, reason=""):
+    """记录一个会毒化会话的标的(供后续会话直接跳过)。"""
+    if not account_id or not symbol:
+        return False
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT IGNORE INTO t_kline_deny (account_id, symbol, reason) VALUES (%s, %s, %s)",
+            (account_id, symbol, (reason or "")[:250]))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()

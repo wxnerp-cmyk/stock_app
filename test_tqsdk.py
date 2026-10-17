@@ -15,9 +15,9 @@ print("订阅合约...")
 for sym in TEST_SYMBOLS:
     try:
         api.get_quote(sym)
-        print(f"  ✓ {sym}")
+        print(f"  [OK] {sym}")
     except Exception as e:
-        print(f"  ✗ {sym}: {e}")
+        print(f"  [X] {sym}: {e}")
 
 print("\n等待行情...")
 count = 0
