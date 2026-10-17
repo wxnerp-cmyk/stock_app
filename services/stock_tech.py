@@ -466,6 +466,13 @@ _PAT_TOTAL = {"total": 0, "ts": 0.0, "ready": 0, "scope": 0}
 _PAT_TOTAL_LOCK = threading.Lock()
 _PAT_LAST = {}                      # symbol -> 最近一次形态数(粘滞, 只增不清零)
 _PAT_WORKER_STARTED = False
+# 页面上报值(2026-10-17): 多标页每拍把【当前页 scope】的形态总数 POST 上来,
+# 导航徽标优先展示它 —— 用户诉求"左侧模块数字与页面顶部不一致":
+#   徽标原口径 = 全局(DEFAULT 6 + EXTRA 11 候选 + 月份合约), 页面顶部 = [LEFT]+RIGHT+已加载子合约,
+#   两边注定对不上(实测 45 vs 12)。统一为"页面上报即所见": 页面开着时两边严格同源;
+#   页面关闭后保留最后值(age 增长, 网关侧自动标"数据陈旧"); 服务重启后回落聚合值兜底。
+_PAT_PAGE = {"total": 0, "ts": 0.0, "ready": 0, "scope": 0, "src": "agg"}
+_PAT_PAGE_LOCK = threading.Lock()
 
 
 def _pat_count_period(pe):
@@ -555,7 +562,30 @@ def start_pat_total_worker():
 
 
 def api_pattern_total():
-    """GET /stocktech/api/pattern_total —— 网关导航"技术分析"项后面的形态总数。"""
+    """GET /stocktech/api/pattern_total —— 网关导航"技术分析"项后面的形态总数。
+
+    取值优先级(2026-10-17): 页面上报值(_PAT_PAGE) > 服务端聚合值(_PAT_TOTAL)。
+    页面上报值 = 多标页 patCheck() 的 _patTotal, 与页面顶部"🔔 形态 N"逐帧同源;
+    页面从未打开(或服务刚重启)时回落聚合线程的全局口径兜底。
+    """
+    with _PAT_PAGE_LOCK:
+        snap = dict(_PAT_PAGE)
+    if snap.get("ts"):
+        ts = snap.get("ts") or 0
+        age = max(0, int(time.time() - ts)) if ts else -1
+        try:
+            upd = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "--:--:--"
+        except Exception:
+            upd = "--:--:--"
+        return jsonify({
+            "ok": True,
+            "total": int(snap.get("total") or 0),
+            "ready": int(snap.get("ready") or 0),
+            "scope": int(snap.get("scope") or 0),
+            "age": age,
+            "updated_at": upd,
+            "src": "page",
+        })
     with _PAT_TOTAL_LOCK:
         snap = dict(_PAT_TOTAL)
     ts = snap.get("ts") or 0
@@ -571,7 +601,34 @@ def api_pattern_total():
         "scope": int(snap.get("scope") or 0),
         "age": age,
         "updated_at": upd,
+        "src": "agg",
     })
+
+
+def api_pattern_total_report():
+    """POST /stocktech/api/pattern_total —— 多标页每拍上报当前页形态总数。
+
+    body: {"total": int, "rows": [[sym, n], ...], "scope": int}
+      total = 页面顶部徽标/悬浮球展示的同一个数(patCheck 的 _patTotal);
+      rows  = 有形态的标的明细(ready = len(rows));
+      scope = 本拍统计范围的标的数([LEFT]+RIGHT+已发现月份合约)。
+    只写内存, 零数据库/零天勤; 网关导航徽标(20s 轮询 GET)读它。
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        total = int(data.get("total") or 0)
+        scope = int(data.get("scope") or 0)
+        rows = data.get("rows") or []
+    except Exception:
+        return jsonify({"ok": False, "msg": "bad payload"}), 400
+    if total < 0 or total > 99999 or scope < 0 or scope > 500:
+        return jsonify({"ok": False, "msg": "out of range"}), 400
+    if not isinstance(rows, list) or len(rows) > 500:
+        return jsonify({"ok": False, "msg": "bad rows"}), 400
+    with _PAT_PAGE_LOCK:
+        _PAT_PAGE.update({"total": total, "ts": time.time(),
+                          "ready": len(rows), "scope": scope, "src": "page"})
+    return jsonify({"ok": True, "total": total})
 
 
 # ===================== 指标补充 =====================
@@ -4620,8 +4677,25 @@ def tech_multi_page():
       _patRows=rows; _patTotal=total;
       if(newN>0) _patUnread+=newN;   // 已读模型: 累计自上次点球(已读)以来的新增条数
       patRender();
+      try{ patReport(); }catch(e){}
       if(_ddSym) patDDRefresh();     // 月份下开着: 就地刷新各行数字与标题合计
       if(newN>0) patBeep();          // 只有【新增】才走提示音(响不响由 patPlay 的门禁决定)
+    }
+    // 形态总数上报(2026-10-17 用户诉求"左侧模块与页面顶部没同步"):
+    //   导航徽标原口径=全局(DEFAULT 6+EXTRA 11+月份合约), 与页面顶部([LEFT]+RIGHT+子合约)
+    //   对不上(实测 45 vs 12)。这里每拍把页面口径 POST 给服务端, 徽标优先取页面值 ->
+    //   两边严格同源; 页面关闭后徽标保留最后值(age 增大, 网关侧自动提示"数据陈旧")。
+    //   值没变就跳过(500ms 节拍不刷请求); total=0 也上报, 保证徽标与页面同步归零。
+    var _patLastReport='';
+    function patReport(){
+      try{
+        var syms=[LEFT].concat(RIGHT), scope=syms.length;
+        syms.forEach(function(s){ scope += (_ddMonths[s]||[]).length; });
+        var payload=JSON.stringify({total:_patTotal, rows:_patRows, scope:scope});
+        if(payload===_patLastReport) return;
+        _patLastReport=payload;
+        fetch(apiBase()+'api/pattern_total',{method:'POST',headers:{'Content-Type':'application/json'},body:payload,cache:'no-store'}).catch(function(){});
+      }catch(e){}
     }
     function patRender(){
       var b=document.getElementById('patBadge'), ball=document.getElementById('patBall');
@@ -4751,6 +4825,9 @@ def register_routes(app, slots, default_key, get_slot=None, make_slot=None):
     app.add_url_rule("/stocktech/api/preload_priority", view_func=api_preload_priority, methods=["POST"], strict_slashes=False)
     app.add_url_rule("/stocktech/api/accounts", view_func=api_tech_accounts, methods=["GET"], strict_slashes=False)
     app.add_url_rule("/stocktech/api/pattern_total", view_func=api_pattern_total, methods=["GET"], strict_slashes=False)
+    # 页面上报通道(2026-10-17): 多标页 patCheck 每拍把当前页形态总数 POST 上来, 导航徽标优先取它
+    app.add_url_rule("/stocktech/api/pattern_total", view_func=api_pattern_total_report,
+                     endpoint="pattern_total_report", methods=["POST"], strict_slashes=False)
     app.add_url_rule("/stocktech/multi", view_func=tech_multi_page, methods=["GET"], strict_slashes=False)
     app.add_url_rule("/stocktech/multi/", view_func=tech_multi_page, methods=["GET"], strict_slashes=False)
     app.add_url_rule("/stocktech/static/<path:filename>", view_func=stock_serve_static, endpoint="stocktech_serve_static", methods=["GET"], strict_slashes=False)
